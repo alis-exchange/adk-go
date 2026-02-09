@@ -38,11 +38,6 @@ type storageSession struct {
 	Events []storageEvent `gorm:"foreignKey:AppName,UserID,SessionID;references:AppName,UserID,ID;constraint:OnDelete:CASCADE"`
 }
 
-// TableName explicitly sets the table name for the storageSession struct.
-func (storageSession) TableName() string {
-	return "sessions"
-}
-
 // Helper to map from internal struct to GORM struct
 func createStorageSession(s *localSession) (*storageSession, error) {
 	return &storageSession{
@@ -97,11 +92,6 @@ type storageEvent struct {
 
 	// Belongs-To relationship: An event belongs to a session.
 	Session storageSession `gorm:"foreignKey:AppName,UserID,SessionID;references:AppName,UserID,ID"`
-}
-
-// TableName explicitly sets the table name for the storageEvent struct.
-func (storageEvent) TableName() string {
-	return "events"
 }
 
 // createStorageEvent translates the application-level Session and Event models
@@ -292,20 +282,10 @@ type storageAppState struct {
 	UpdateTime time.Time `gorm:"precision:6"`
 }
 
-// TableName explicitly sets the table name for the AppState struct.
-func (storageAppState) TableName() string {
-	return "app_states"
-}
-
 // UserState corresponds to the 'user_states' table.
 type storageUserState struct {
 	AppName    string `gorm:"primaryKey;"`
 	UserID     string `gorm:"primaryKey;"`
 	State      stateMap
 	UpdateTime time.Time `gorm:"precision:6"`
-}
-
-// TableName explicitly sets the table name for the UserState struct.
-func (storageUserState) TableName() string {
-	return "user_states"
 }
