@@ -564,6 +564,45 @@ func TestRemoteAgent_ADK2A2A(t *testing.T) {
 				{TurnComplete: true},
 			},
 		},
+		{
+			name: "partial and non-partial event aggregation",
+			remoteEvents: []a2a.Event{
+				artifactEvent,
+				&a2a.TaskArtifactUpdateEvent{
+					TaskID:    task.ID,
+					ContextID: task.ContextID,
+					Artifact:  &a2a.Artifact{ID: artifactEvent.Artifact.ID, Parts: a2a.ContentParts{a2a.TextPart{Text: "1"}}},
+					Append:    true,
+				},
+				&a2a.TaskArtifactUpdateEvent{
+					TaskID:    task.ID,
+					ContextID: task.ContextID,
+					Artifact:  &a2a.Artifact{ID: artifactEvent.Artifact.ID, Parts: a2a.ContentParts{a2a.TextPart{Text: "2"}}},
+					Append:    true,
+				},
+				&a2a.TaskArtifactUpdateEvent{
+					TaskID:    task.ID,
+					ContextID: task.ContextID,
+					Artifact:  &a2a.Artifact{ID: artifactEvent.Artifact.ID, Parts: a2a.ContentParts{a2a.TextPart{Text: "3"}}},
+					Append:    false,
+				},
+				&a2a.TaskArtifactUpdateEvent{
+					TaskID:    task.ID,
+					ContextID: task.ContextID,
+					Artifact:  &a2a.Artifact{ID: artifactEvent.Artifact.ID, Parts: a2a.ContentParts{a2a.TextPart{Text: "4"}}},
+					Append:    true,
+				},
+				newFinalStatusUpdate(task, a2a.TaskStateCompleted, a2a.TextPart{Text: "5"}),
+			},
+			wantResponses: []model.LLMResponse{
+				{Content: genai.NewContentFromText("1", genai.RoleModel), Partial: true},
+				{Content: genai.NewContentFromText("2", genai.RoleModel), Partial: true},
+				{Content: genai.NewContentFromText("3", genai.RoleModel), Partial: true},
+				{Content: genai.NewContentFromText("4", genai.RoleModel), Partial: true},
+				{Content: genai.NewContentFromText("34", genai.RoleModel)},
+				{Content: genai.NewContentFromText("5", genai.RoleModel), TurnComplete: true},
+			},
+		},
 	}
 
 	ignoreFields := []cmp.Option{

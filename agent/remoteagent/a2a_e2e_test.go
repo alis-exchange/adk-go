@@ -18,6 +18,7 @@ package remoteagent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -58,8 +59,6 @@ const (
 
 	transferToolName      = "transfer_to_agent"
 	modelTextRootTransfer = "transfering... please hold... beepboop..."
-
-	ticketStatusApproved = "approved"
 )
 
 type approvalStatus string
@@ -67,6 +66,7 @@ type approvalStatus string
 var (
 	approvalStatusPending  approvalStatus = "pending"
 	approvalStatusApproved approvalStatus = "approved"
+	approvalStatusVerified approvalStatus = "verified"
 )
 
 type approval struct {
@@ -78,111 +78,166 @@ type approval struct {
  * a2aclient -> a2aserver -> adka2a.Executor -> llmagent with a long running tool
  */
 func TestA2AInputRequired(t *testing.T) {
-	// Server
-	inputRequestingAgent := newInputRequestingAgent(t, "agent-b")
-	executor := newAgentExecutor(inputRequestingAgent, nil)
-	server := startA2AServer(executor)
-	defer server.Close()
-
-	// Client
-	client := newA2AClient(t, server)
-
-	// Initial message triggers input required
-	taskContent := "Perform important task!"
-	msg1 := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: taskContent})
-	task1 := mustSendMessage(t, client, msg1)
-	if task1.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("client.SendMessage(Initial) result state = %q, want %q", task1.Status.State, a2a.TaskStateInputRequired)
-	}
-	if len(task1.Artifacts) != 1 {
-		t.Fatalf("len(task.Artifacts) = %d, want 1", len(task1.Artifacts))
-	}
-
-	// Incomplete followup keeps the task in input-required
-	incompleteFollowupText := "Is it really necessary?"
-	msg2 := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: incompleteFollowupText})
-	task2 := mustSendMessage(t, client, msg2)
-	if task2.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task2.Status.State, a2a.TaskStateInputRequired)
-	}
-	if len(task2.Artifacts) != 1 {
-		t.Fatalf("len(task.Artifacts) = %d, want 1", len(task2.Artifacts))
-	}
-
-	// Required input gets delivered
-
-	// Verify that error message is present
-	if len(task2.Status.Message.Parts) < 2 {
-		t.Fatalf("task2.Status.Message.Parts len = %d; want >= 2", len(task2.Status.Message.Parts))
-	}
-	// The last part should be the error message
-	lastPart := task2.Status.Message.Parts[len(task2.Status.Message.Parts)-1]
-	tp, ok := lastPart.(a2a.TextPart)
-	if !ok {
-		t.Fatalf("last part is not TextPart")
-	}
-	if !strings.Contains(tp.Text, "no input provided") {
-		t.Errorf("last part text = %q; want it to contain 'no input provided'", tp.Text)
-	}
-
-	// Another incomplete followup should not accumulate error messages
-	msg2a := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: "Still debating?"})
-	task2a := mustSendMessage(t, client, msg2a)
-	if task2a.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("client.SendMessage(IncompleteInput 2) result state = %q, want %q", task2a.Status.State, a2a.TaskStateInputRequired)
+	testCases := []struct {
+		name                    string
+		tool                    tool.Tool
+		createApproval          func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part
+		wantFirstArtifactParts  a2a.ContentParts
+		wantSecondArtifactParts a2a.ContentParts
+	}{
+		{
+			name: "long-running",
+			tool: newLongRunningTool(t),
+			createApproval: func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part {
+				return createLongRunningToolApproval(t, pendingResponse)
+			},
+			wantFirstArtifactParts: a2a.ContentParts{
+				a2a.TextPart{Text: modelTextRequiresApproval},
+				a2a.TextPart{Text: modelTextWaitingForApproval},
+			},
+			wantSecondArtifactParts: a2a.ContentParts{a2a.TextPart{Text: modelTextTaskComplete}},
+		},
+		{
+			name: "tool confirmation",
+			tool: newToolConfirmation(t),
+			createApproval: func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part {
+				return createToolConfirmationApproval(t, toolCall)
+			},
+			wantFirstArtifactParts: a2a.ContentParts{
+				a2a.TextPart{Text: modelTextRequiresApproval},
+				a2a.DataPart{
+					Data:     map[string]any{"name": approvalToolName},
+					Metadata: map[string]any{"adk_is_long_running": false, "adk_type": "function_call"},
+				},
+				a2a.DataPart{
+					Data: map[string]any{
+						"name":     approvalToolName,
+						"response": map[string]any{"status": string(approvalStatusPending)},
+					},
+					Metadata: map[string]any{"adk_type": "function_response"},
+				},
+			},
+			wantSecondArtifactParts: a2a.ContentParts{
+				a2a.DataPart{
+					Data: map[string]any{
+						"name":     approvalToolName,
+						"response": map[string]any{"status": string(approvalStatusVerified)},
+					},
+					Metadata: map[string]any{"adk_type": "function_response"},
+				},
+				a2a.TextPart{Text: modelTextTaskComplete},
+			},
+		},
 	}
 
-	// Count validation errors in parts
-	validationErrors := 0
-	for _, p := range task2a.Status.Message.Parts {
-		if tp, ok := p.(a2a.TextPart); ok && strings.Contains(tp.Text, "no input provided") {
-			validationErrors++
-		}
-	}
-	if validationErrors != 1 {
-		t.Errorf("validationErrors count = %d; want 1", validationErrors)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	toolCall, pendingResponse := findLongRunningCall(t, toGenaiParts(t, task2.Status.Message.Parts))
-	approvedResponse := pendingToApproved(t, pendingResponse)
-	msg3 := a2a.NewMessageForTask(a2a.MessageRoleUser, task2,
-		a2a.TextPart{Text: "LGTM"},
-		toA2AParts(t, []*genai.Part{approvedResponse}, []string{toolCall.ID})[0],
-	)
-	task3 := mustSendMessage(t, client, msg3)
-	if task3.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task3.Status.State, a2a.TaskStateCompleted)
-	}
+			// Server
+			inputRequestingAgent := newInputRequestingAgent(t, "agent-b", tc.tool)
+			executor := newAgentExecutor(inputRequestingAgent, nil)
+			server := startA2AServer(executor)
+			defer server.Close()
 
-	// Verify the final task state
-	opts := []cmp.Option{
-		cmpopts.EquateEmpty(),
-		cmpopts.IgnoreMapEntries(func(k string, v any) bool { return k == "id" }),
-		cmpopts.IgnoreFields(a2a.Message{}, "ID"),
-	}
-	if len(task3.Artifacts) != 2 {
-		t.Fatalf("len(task.Artifacts) = %d, want 2", len(task3.Artifacts))
-	}
+			// Client
+			client := newA2AClient(t, server)
 
-	gotHistory := task3.History
-	wantHistory := []*a2a.Message{msg1, msg2, task1.Status.Message, msg2a, task2a.Status.Message, msg3, task2a.Status.Message}
-	if diff := cmp.Diff(wantHistory, gotHistory, opts...); diff != "" {
-		t.Fatalf("unexpected history (+got,-want) diff:\n%s", diff)
-	}
+			// Initial message triggers input required
+			taskContent := "Perform important task!"
+			msg1 := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: taskContent})
+			task1 := mustSendMessage(t, client, msg1)
+			if task1.Status.State != a2a.TaskStateInputRequired {
+				t.Fatalf("client.SendMessage(Initial) result state = %q, want %q", task1.Status.State, a2a.TaskStateInputRequired)
+			}
+			if len(task1.Artifacts) != 1 {
+				t.Fatalf("len(task.Artifacts) = %d, want 1", len(task1.Artifacts))
+			}
 
-	gotFirstArtifactParts := adka2a.WithoutPartialArtifacts(task3.Artifacts)[0].Parts
-	wantFirstAftifactParts := a2a.ContentParts{
-		a2a.TextPart{Text: modelTextRequiresApproval},
-		a2a.TextPart{Text: modelTextWaitingForApproval},
-	}
-	if diff := cmp.Diff(wantFirstAftifactParts, gotFirstArtifactParts, opts...); diff != "" {
-		t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
-	}
+			// Incomplete followup keeps the task in input-required
+			incompleteFollowupText := "Is it really necessary?"
+			msg2 := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: incompleteFollowupText})
+			task2 := mustSendMessage(t, client, msg2)
+			if task2.Status.State != a2a.TaskStateInputRequired {
+				t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task2.Status.State, a2a.TaskStateInputRequired)
+			}
+			if len(task2.Artifacts) != 1 {
+				t.Fatalf("len(task.Artifacts) = %d, want 1", len(task2.Artifacts))
+			}
 
-	gotSecondArtifactParts := task3.Artifacts[1].Parts
-	wantSecondArtifactParts := a2a.ContentParts{a2a.TextPart{Text: modelTextTaskComplete}}
-	if diff := cmp.Diff(wantSecondArtifactParts, gotSecondArtifactParts, opts...); diff != "" {
-		t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			// Required input gets delivered
+
+			// Verify that error message is present
+			if len(task2.Status.Message.Parts) < 2 {
+				t.Fatalf("task2.Status.Message.Parts len = %d; want >= 2", len(task2.Status.Message.Parts))
+			}
+			// The last part should be the error message
+			lastPart := task2.Status.Message.Parts[len(task2.Status.Message.Parts)-1]
+			tp, ok := lastPart.(a2a.TextPart)
+			if !ok {
+				t.Fatalf("last part is not TextPart")
+			}
+			if !strings.Contains(tp.Text, "no input provided") {
+				t.Errorf("last part text = %q; want it to contain 'no input provided'", tp.Text)
+			}
+
+			// Another incomplete followup should not accumulate error messages
+			msg2a := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: "Still debating?"})
+			task2a := mustSendMessage(t, client, msg2a)
+			if task2a.Status.State != a2a.TaskStateInputRequired {
+				t.Fatalf("client.SendMessage(IncompleteInput 2) result state = %q, want %q", task2a.Status.State, a2a.TaskStateInputRequired)
+			}
+
+			// Count validation errors in parts
+			validationErrors := 0
+			for _, p := range task2a.Status.Message.Parts {
+				if tp, ok := p.(a2a.TextPart); ok && strings.Contains(tp.Text, "no input provided") {
+					validationErrors++
+				}
+			}
+			if validationErrors != 1 {
+				t.Errorf("validationErrors count = %d; want 1", validationErrors)
+			}
+
+			// Check for adk_request_confirmation
+			toolCall, pendingResponse := findLongRunningCall(t, toGenaiParts(t, task2.Status.Message.Parts))
+			approvedResponse := tc.createApproval(t, toolCall, pendingResponse)
+
+			msg3 := a2a.NewMessageForTask(a2a.MessageRoleUser, task2,
+				a2a.TextPart{Text: "LGTM"},
+				toA2AParts(t, []*genai.Part{approvedResponse}, []string{toolCall.ID})[0],
+			)
+			task3 := mustSendMessage(t, client, msg3)
+			if task3.Status.State != a2a.TaskStateCompleted {
+				t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task3.Status.State, a2a.TaskStateCompleted)
+			}
+
+			// Verify the final task state
+			opts := []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpopts.IgnoreMapEntries(func(k string, v any) bool { return strings.HasSuffix(k, "id") }),
+				cmpopts.IgnoreFields(a2a.Message{}, "ID"),
+			}
+			if len(task3.Artifacts) != 2 {
+				t.Fatalf("len(task.Artifacts) = %d, want 2", len(task3.Artifacts))
+			}
+
+			gotHistory := task3.History
+			wantHistory := []*a2a.Message{msg1, msg2, task1.Status.Message, msg2a, task2a.Status.Message, msg3, task2a.Status.Message}
+			if diff := cmp.Diff(wantHistory, gotHistory, opts...); diff != "" {
+				t.Fatalf("unexpected history (+got,-want) diff:\n%s", diff)
+			}
+
+			gotFirstArtifactParts := adka2a.WithoutPartialArtifacts(task3.Artifacts)[0].Parts
+			if diff := cmp.Diff(tc.wantFirstArtifactParts, gotFirstArtifactParts, opts...); diff != "" {
+				t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			}
+
+			gotSecondArtifactParts := task3.Artifacts[1].Parts
+			if diff := cmp.Diff(tc.wantSecondArtifactParts, gotSecondArtifactParts, opts...); diff != "" {
+				t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -191,74 +246,127 @@ func TestA2AInputRequired(t *testing.T) {
  * 		remotesubagent -> server B -> adka2a.Executor B -> llmagent with a long running tool
  */
 func TestA2AMultiHopInputRequired(t *testing.T) {
-	// Server B
-	inputRequestingAgent := newInputRequestingAgent(t, "agent-b")
-	executorB := newAgentExecutor(inputRequestingAgent, nil)
-	serverB := startA2AServer(executorB)
-	defer serverB.Close()
-
-	// Server A
-	remoteAgent := newA2ARemoteAgent(t, "remote-"+inputRequestingAgent.Name(), serverB)
-	rootAgent := newRootAgent("root", remoteAgent)
-	executorA := newAgentExecutor(rootAgent, nil)
-	serverA := startA2AServer(executorA)
-	defer serverA.Close()
-
-	// Client for Server A
-	client := newA2AClient(t, serverA)
-
-	// Initial message triggers input required
-	msg1 := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "Hello, perform important task!"})
-	task1 := mustSendMessage(t, client, msg1)
-	if task1.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("client.SendMessage(Initial) result state = %q, want %q", task1.Status.State, a2a.TaskStateInputRequired)
+	remoteAgentName := "remote-agent-B"
+	testCases := []struct {
+		name                    string
+		tool                    tool.Tool
+		createApproval          func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part
+		wantFirstArtifactParts  a2a.ContentParts
+		wantSecondArtifactParts a2a.ContentParts
+	}{
+		{
+			name: "long-running",
+			tool: newLongRunningTool(t),
+			createApproval: func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part {
+				return createLongRunningToolApproval(t, pendingResponse)
+			},
+			wantFirstArtifactParts: toA2AParts(t, []*genai.Part{
+				genai.NewPartFromText(modelTextRootTransfer),
+				genai.NewPartFromFunctionCall(transferToolName, map[string]any{"agent_name": remoteAgentName}),
+				genai.NewPartFromFunctionResponse(transferToolName, nil),
+				genai.NewPartFromText(modelTextRequiresApproval),
+				genai.NewPartFromText(modelTextWaitingForApproval),
+			}, []string{}),
+			wantSecondArtifactParts: a2a.ContentParts{
+				a2a.TextPart{Text: modelTextTaskComplete},
+			},
+		},
+		{
+			name: "tool confirmation",
+			tool: newToolConfirmation(t),
+			createApproval: func(t *testing.T, toolCall *genai.FunctionCall, pendingResponse *genai.FunctionResponse) *genai.Part {
+				return createToolConfirmationApproval(t, toolCall)
+			},
+			wantFirstArtifactParts: toA2AParts(t, []*genai.Part{
+				genai.NewPartFromText(modelTextRootTransfer),
+				genai.NewPartFromFunctionCall(transferToolName, map[string]any{"agent_name": remoteAgentName}),
+				genai.NewPartFromFunctionResponse(transferToolName, nil),
+				genai.NewPartFromText(modelTextRequiresApproval),
+				genai.NewPartFromFunctionCall(approvalToolName, nil),
+				genai.NewPartFromFunctionResponse(approvalToolName, map[string]any{"status": string(approvalStatusPending)}),
+			}, []string{}),
+			wantSecondArtifactParts: a2a.ContentParts{
+				a2a.DataPart{
+					Data: map[string]any{
+						"name":     approvalToolName,
+						"response": map[string]any{"status": string(approvalStatusVerified)},
+					},
+					Metadata: map[string]any{"adk_type": "function_response"},
+				},
+				a2a.TextPart{Text: modelTextTaskComplete},
+			},
+		},
 	}
 
-	// Incomplete followup keeps the task in input-required
-	msg2 := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: "Is it really necessary?"})
-	task2 := mustSendMessage(t, client, msg2)
-	if task2.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task2.Status.State, a2a.TaskStateInputRequired)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Required input gets delivered
-	toolCall, pendingResponse := findLongRunningCall(t, toGenaiParts(t, filterPartial(task2.Status.Message.Parts)))
-	approvedResponse := pendingToApproved(t, pendingResponse)
-	msg3 := a2a.NewMessageForTask(a2a.MessageRoleUser, task2,
-		a2a.TextPart{Text: "LGTM"},
-		toA2AParts(t, []*genai.Part{approvedResponse}, nil)[0],
-	)
-	task3 := mustSendMessage(t, client, msg3)
-	if task3.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task3.Status.State, a2a.TaskStateCompleted)
-	}
+			// Server B
+			inputRequestingAgent := newInputRequestingAgent(t, "agent-b", tc.tool)
+			executorB := newAgentExecutor(inputRequestingAgent, nil)
+			serverB := startA2AServer(executorB)
+			defer serverB.Close()
 
-	// Verify task on server A
-	opts := []cmp.Option{cmpopts.EquateEmpty(), cmpopts.IgnoreMapEntries(func(k string, v any) bool {
-		return k == "id"
-	})}
-	gotHistory := task3.History
-	wantHistory := []*a2a.Message{msg1, msg2, task1.Status.Message, msg3, task2.Status.Message}
-	if diff := cmp.Diff(wantHistory, gotHistory, opts...); diff != "" {
-		t.Fatalf("unexpected history (+got,-want) diff:\n%s", diff)
-	}
+			// Server A
+			remoteAgent := newA2ARemoteAgent(t, remoteAgentName, serverB)
+			rootAgent := newRootAgent("root", remoteAgent)
+			executorA := newAgentExecutor(rootAgent, nil)
+			serverA := startA2AServer(executorA)
+			defer serverA.Close()
 
-	gotFirstArtifactParts := filterPartial(task3.Artifacts[0].Parts)
-	wantFirstAftifactParts := toA2AParts(t, []*genai.Part{
-		genai.NewPartFromText(modelTextRootTransfer),
-		genai.NewPartFromFunctionCall(transferToolName, map[string]any{"agent_name": remoteAgent.Name()}),
-		genai.NewPartFromFunctionResponse(transferToolName, nil),
-		genai.NewPartFromText(modelTextRequiresApproval),
-		genai.NewPartFromText(modelTextWaitingForApproval),
-	}, []string{toolCall.ID})
-	if diff := cmp.Diff(wantFirstAftifactParts, gotFirstArtifactParts, opts...); diff != "" {
-		t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
-	}
+			// Client for Server A
+			client := newA2AClient(t, serverA)
 
-	gotSecondArtifactParts := filterPartial(adka2a.WithoutPartialArtifacts(task3.Artifacts)[1].Parts)
-	wantSecondArtifactParts := []a2a.Part{a2a.TextPart{Text: modelTextTaskComplete}}
-	if diff := cmp.Diff(wantSecondArtifactParts, gotSecondArtifactParts, opts...); diff != "" {
-		t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			// Initial message triggers input required
+			msg1 := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "Hello, perform important task!"})
+			task1 := mustSendMessage(t, client, msg1)
+			if task1.Status.State != a2a.TaskStateInputRequired {
+				t.Fatalf("client.SendMessage(Initial) result state = %q, want %q", task1.Status.State, a2a.TaskStateInputRequired)
+			}
+
+			// Incomplete followup keeps the task in input-required
+			msg2 := a2a.NewMessageForTask(a2a.MessageRoleUser, task1, a2a.TextPart{Text: "Is it really necessary?"})
+			task2 := mustSendMessage(t, client, msg2)
+			if task2.Status.State != a2a.TaskStateInputRequired {
+				t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task2.Status.State, a2a.TaskStateInputRequired)
+			}
+
+			// Required input gets delivered
+			toolCall, pendingResponse := findLongRunningCall(t, toGenaiParts(t, filterPartial(task2.Status.Message.Parts)))
+			approvedResponse := tc.createApproval(t, toolCall, pendingResponse)
+			msg3 := a2a.NewMessageForTask(a2a.MessageRoleUser, task2,
+				a2a.TextPart{Text: "LGTM"},
+				toA2AParts(t, []*genai.Part{approvedResponse}, nil)[0],
+			)
+			task3 := mustSendMessage(t, client, msg3)
+			if task3.Status.State != a2a.TaskStateCompleted {
+				t.Fatalf("client.SendMessage(IncompleteInput) result state = %q, want %q", task3.Status.State, a2a.TaskStateCompleted)
+			}
+
+			// Verify task on server A
+			opts := []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpopts.IgnoreMapEntries(func(k string, v any) bool {
+					return strings.HasSuffix(k, "id")
+				}),
+			}
+			gotHistory := task3.History
+			wantHistory := []*a2a.Message{msg1, msg2, task1.Status.Message, msg3, task2.Status.Message}
+			if diff := cmp.Diff(wantHistory, gotHistory, opts...); diff != "" {
+				t.Fatalf("unexpected history (+got,-want) diff:\n%s", diff)
+			}
+
+			gotFirstArtifactParts := a2a.ContentParts(filterPartial(task3.Artifacts[0].Parts))
+			if diff := cmp.Diff(tc.wantFirstArtifactParts, gotFirstArtifactParts, opts...); diff != "" {
+				t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			}
+
+			gotSecondArtifactParts := a2a.ContentParts(filterPartial(adka2a.WithoutPartialArtifacts(task3.Artifacts)[1].Parts))
+			if diff := cmp.Diff(tc.wantSecondArtifactParts, gotSecondArtifactParts, opts...); diff != "" {
+				t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -637,7 +745,7 @@ func (d *llmStub) GenerateContent(ctx context.Context, req *model.LLMRequest, st
 	return d.generateContent(ctx, req, stream)
 }
 
-func newInputRequestingAgent(t *testing.T, name string) agent.Agent {
+func newLongRunningTool(t *testing.T) tool.Tool {
 	t.Helper()
 	requestApproval, err := functiontool.New(functiontool.Config{
 		Name:          approvalToolName,
@@ -649,23 +757,61 @@ func newInputRequestingAgent(t *testing.T, name string) agent.Agent {
 	if err != nil {
 		t.Fatalf("functiontool.New() error = %v", err)
 	}
+	return requestApproval
+}
+
+func newToolConfirmation(t *testing.T) tool.Tool {
+	t.Helper()
+
+	requestApproval, err := functiontool.New(functiontool.Config{
+		Name:        approvalToolName,
+		Description: "Request approval before proceeding.",
+	}, func(ctx tool.Context, x map[string]any) (approval, error) {
+		confirmation := ctx.ToolConfirmation()
+		if confirmation == nil {
+			ticketID := a2a.NewContextID()
+			if err := ctx.RequestConfirmation("I need approval", map[string]string{"ticket_id": ticketID}); err != nil {
+				return approval{}, err
+			}
+			return approval{Status: approvalStatusPending, TicketID: ticketID}, nil
+		}
+		if !confirmation.Confirmed {
+			return approval{}, fmt.Errorf("confirmation was rejected")
+		}
+		jsonBytes, err := json.Marshal(confirmation.Payload)
+		if err != nil {
+			return approval{}, fmt.Errorf("error marshalling payload %s: %w", confirmation.Payload, err)
+		}
+		var payload approval
+		if err := json.Unmarshal(jsonBytes, &payload); err != nil {
+			return approval{}, fmt.Errorf("error unmarshalling payload %s: %w", confirmation.Payload, err)
+		}
+		return approval{Status: approvalStatusVerified, TicketID: payload.TicketID}, nil
+	})
+	if err != nil {
+		t.Fatalf("functiontool.New() error = %v", err)
+	}
+	return requestApproval
+}
+
+func newInputRequestingAgent(t *testing.T, name string, requestApproval tool.Tool) agent.Agent {
+	t.Helper()
 	return utils.Must(llmagent.New(llmagent.Config{
 		Name:  name,
 		Tools: []tool.Tool{requestApproval},
 		Model: &llmStub{
-			name: name + "-model",
 			generateContent: func(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 				return func(yield func(*model.LLMResponse, error) bool) {
 					lastMessage := req.Contents[len(req.Contents)-1]
-					_, approvalResult := findLongRunningCall(t, lastMessage.Parts)
+					approvalResult := utils.FunctionResponses(lastMessage)
 					var content *genai.Content
 					switch {
-					case approvalResult == nil: // the first model invocation - invoke a long running tool
+					case len(approvalResult) == 0: // the first model invocation - invoke a long running tool
 						content = genai.NewContentFromParts([]*genai.Part{
 							genai.NewPartFromText(modelTextRequiresApproval),
 							genai.NewPartFromFunctionCall(approvalToolName, map[string]any{}),
 						}, genai.RoleModel)
-					case approvalResult.Response["status"] != ticketStatusApproved: // the tool returned a pending result
+					case len(approvalResult) == 1 && approvalResult[0].Response["status"] == string(approvalStatusPending): // the tool returned a pending result
 						content = genai.NewContentFromText(modelTextWaitingForApproval, genai.RoleModel)
 					default: // user approval is in the session
 						content = genai.NewContentFromText(modelTextTaskComplete, genai.RoleModel)
@@ -807,7 +953,7 @@ func newA2AClient(t *testing.T, server *testA2AServer) *a2aclient.Client {
 	return result
 }
 
-func pendingToApproved(t *testing.T, pendingResponse *genai.FunctionResponse) *genai.Part {
+func createLongRunningToolApproval(t *testing.T, pendingResponse *genai.FunctionResponse) *genai.Part {
 	t.Helper()
 	pendingApproval := fromMap[approval](t, pendingResponse.Response)
 	response := genai.NewPartFromFunctionResponse(approvalToolName, toMap(t, approval{
@@ -816,6 +962,32 @@ func pendingToApproved(t *testing.T, pendingResponse *genai.FunctionResponse) *g
 	}))
 	response.FunctionResponse.ID = pendingResponse.ID
 	return response
+}
+
+func createToolConfirmationApproval(t *testing.T, toolCall *genai.FunctionCall) *genai.Part {
+	t.Helper()
+	tcMap, ok := toolCall.Args["toolConfirmation"].(map[string]any)
+	if !ok {
+		t.Fatalf("toolCall = %v, want toolConfirmation", toolCall)
+	}
+	payloadMap, ok := tcMap["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("toolCall = %v, want payload", toolCall)
+	}
+	ticketID, ok := payloadMap["ticket_id"].(string)
+	if !ok {
+		t.Fatalf("toolCall = %v, want ticket_id", toolCall)
+	}
+	return &genai.Part{
+		FunctionResponse: &genai.FunctionResponse{
+			ID:   toolCall.ID,
+			Name: toolCall.Name,
+			Response: map[string]any{
+				"confirmed": true,
+				"payload":   map[string]string{"ticket_id": ticketID},
+			},
+		},
+	}
 }
 
 func newGeminiTestClientConfig(t *testing.T, rrfile string) (http.RoundTripper, bool) {
