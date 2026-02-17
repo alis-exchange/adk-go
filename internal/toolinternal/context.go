@@ -111,6 +111,13 @@ func (c *toolContext) ToolConfirmation() *toolconfirmation.ToolConfirmation {
 	return c.toolConfirmation
 }
 
+func (c *toolContext) SessionState() session.ReadonlyState {
+	if c.invocationContext.Session() == nil {
+		return nil
+	}
+	return c.invocationContext.Session().State()
+}
+
 func (c *toolContext) RequestConfirmation(hint string, payload any) error {
 	if c.functionCallID == "" {
 		return fmt.Errorf("error function call id not set when requesting confirmation for tool")

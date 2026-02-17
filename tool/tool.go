@@ -87,6 +87,11 @@ type Context interface {
 	//   - error: If there was a failure in initiating the confirmation process itself (e.g., invalid
 	//     arguments, issue with the event system). The request to ask the user has not been sent.
 	RequestConfirmation(hint string, payload any) error
+
+	// SessionState returns the session state for the current invocation.
+	// Tools can use this to read credentials or other state (e.g. for OAuth).
+	// May return nil if no session is available.
+	SessionState() session.ReadonlyState
 }
 
 // Toolset is an interface for a collection of tools. It allows grouping
