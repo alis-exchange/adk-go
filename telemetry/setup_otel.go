@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/contrib/detectors/gcp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/oauth2"
@@ -77,11 +78,13 @@ func newInternal(cfg *config) (*Providers, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize tracer provider: %w", err)
 	}
-	// TODO(#479) init logger provider
+
+	lp := initLoggerProvider(cfg)
 	// TODO(#479) init meter provider
 
 	return &Providers{
 		TracerProvider: tp,
+		LoggerProvider: lp,
 	}, nil
 }
 
@@ -197,6 +200,22 @@ func initTracerProvider(cfg *config) (*sdktrace.TracerProvider, error) {
 	tp := sdktrace.NewTracerProvider(opts...)
 
 	return tp, nil
+}
+
+// TODO(#479) finish the implementation and add the default exporter if env vars are set.
+func initLoggerProvider(cfg *config) *sdklog.LoggerProvider {
+	if len(cfg.logProcessors) == 0 {
+		return nil
+	}
+	opts := []sdklog.LoggerProviderOption{
+		sdklog.WithResource(cfg.resource),
+	}
+	for _, p := range cfg.logProcessors {
+		opts = append(opts, sdklog.WithProcessor(p))
+	}
+	lp := sdklog.NewLoggerProvider(opts...)
+
+	return lp
 }
 
 func newGcpSpanExporter(ctx context.Context, cfg *config) (sdktrace.SpanExporter, error) {
