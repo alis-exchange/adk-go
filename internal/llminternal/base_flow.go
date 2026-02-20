@@ -29,6 +29,7 @@ import (
 	"google.golang.org/adk/internal/agent/parentmap"
 	"google.golang.org/adk/internal/agent/runconfig"
 	icontext "google.golang.org/adk/internal/context"
+	"google.golang.org/adk/internal/llminternal/googlellm"
 	"google.golang.org/adk/internal/plugininternal/plugincontext"
 	"google.golang.org/adk/internal/telemetry"
 	"google.golang.org/adk/internal/toolinternal"
@@ -338,6 +339,7 @@ func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.LLMRequest, state
 			// Function call ID is optional in genai API and some models do not use the field.
 			// Set it in case after model callbacks use it.
 			utils.PopulateClientFunctionCallID(resp.Content)
+
 			callbackResp, callbackErr := f.runAfterModelCallbacks(ctx, resp, stateDelta, err)
 			// TODO: check if we should stop iterator on the first error from stream or continue yielding next results.
 			if callbackErr != nil {
@@ -365,14 +367,18 @@ func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.LLMRequest, state
 	}
 }
 
-// generateContent wraps the LLM call with tracing.
-// The generate_contenxt span should cover only calls to LLM. Plugins and callbacks should be outside of this span.
+// generateContent wraps the LLM call with tracing and logging.
+// The generate_content span should cover only calls to LLM. Plugins and callbacks should be outside of this span.
 func generateContent(ctx agent.InvocationContext, m model.LLM, req *model.LLMRequest, useStream bool) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		spanCtx, span := telemetry.StartGenerateContentSpan(ctx, telemetry.StartGenerateContentSpanParams{
 			ModelName: m.Name(),
 		})
 		ctx = ctx.WithContext(spanCtx)
+		backend := googlellm.GetGoogleLLMVariant(m)
+		// Log request before calling the model.
+		telemetry.LogRequest(ctx, req, backend)
+
 		var lastResponse *model.LLMResponse
 		var lastErr error
 		spanEnded := false
@@ -393,8 +399,12 @@ func generateContent(ctx agent.InvocationContext, m model.LLM, req *model.LLMReq
 		for resp, err := range m.GenerateContent(ctx, req, useStream) {
 			lastResponse = resp
 			lastErr = err
-			if err != nil || !resp.Partial {
-				// Complete the span immediately to avoid capturing the upstream yield processing time.
+			// Complete the span immediately to avoid capturing the upstream yield processing time.
+			if err != nil {
+				endSpanAndTrackResult()
+			} else if !resp.Partial {
+				// Log only final responses.
+				telemetry.LogResponse(ctx, resp, backend)
 				endSpanAndTrackResult()
 			}
 			if !yield(resp, err) {
