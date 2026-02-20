@@ -48,8 +48,12 @@ type eventProcessor struct {
 	// Will be sent as the final Task status update if not nil.
 	failedEvent *a2a.TaskStatusUpdateEvent
 
+	// authRequiredProcessor handles auth-required events signaled via StateDelta (adk_auth_request_*).
+	// authRequiredProcessor.event will be sent as the final Task status update if failedEvent is nil.
+	authRequiredProcessor *authRequiredProcessor
+
 	// inputRequiredProcessor is used to postpone sending input-required in response to long-running function tool calls.
-	// inputRequiredProcessor.event will be sent as the final Task status update if failedEvent is nil.
+	// inputRequiredProcessor.event will be sent as the final Task status update if failedEvent and authRequiredProcessor.event are nil.
 	inputRequiredProcessor *inputRequiredProcessor
 }
 
@@ -59,6 +63,7 @@ func newEventProcessor(
 	converter GenAIPartConverter,
 ) *eventProcessor {
 	return &eventProcessor{
+		authRequiredProcessor:  newAuthRequiredProcessor(reqCtx),
 		inputRequiredProcessor: newInputRequiredProcessor(reqCtx),
 		partConverter:          converter,
 		reqCtx:                 reqCtx,
@@ -89,6 +94,10 @@ func (p *eventProcessor) process(ctx context.Context, event *session.Event) (*a2
 		}
 	}
 
+	event, err = p.authRequiredProcessor.process(event)
+	if err != nil {
+		return nil, fmt.Errorf("auth required processing failed: %w", err)
+	}
 	event, err = p.inputRequiredProcessor.process(event)
 	if err != nil {
 		return nil, fmt.Errorf("input required processing failed: %w", err)
@@ -157,7 +166,7 @@ func (p *eventProcessor) makeFinalArtifactUpdate() *a2a.TaskArtifactUpdateEvent 
 }
 
 func (p *eventProcessor) makeFinalStatusUpdate() *a2a.TaskStatusUpdateEvent {
-	for _, event := range []*a2a.TaskStatusUpdateEvent{p.failedEvent, p.inputRequiredProcessor.event} {
+	for _, event := range []*a2a.TaskStatusUpdateEvent{p.failedEvent, p.authRequiredProcessor.event, p.inputRequiredProcessor.event} {
 		if event != nil {
 			event.Metadata = setActionsMeta(event.Metadata, p.terminalActions)
 			return event

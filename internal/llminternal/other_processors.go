@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"log"
 
 	"google.golang.org/genai"
 
@@ -45,18 +46,34 @@ func codeExecutionRequestProcessor(ctx agent.InvocationContext, req *model.LLMRe
 }
 
 func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error] {
+	invID := ctx.InvocationID()
+	log.Printf("[authPreprocessor][%s] STEP 1: entered", invID)
+
 	return func(yield func(*session.Event, error) bool) {
 		toolsmap := make(map[string]tool.Tool)
 		for _, t := range f.Tools {
 			toolsmap[t.Name()] = t
 		}
+		log.Printf("[authPreprocessor][%s] STEP 2: tools loaded, count=%d, names=%v", invID, len(toolsmap), mapKeys(toolsmap))
 
 		var events []*session.Event
 		if ctx.Session() != nil {
 			for e := range ctx.Session().Events().All() {
+				log.Printf("[authPreprocessor][%s] STEP 3: event id=%s author=%s parts=%d", invID, e.ID, e.Author, len(e.Content.Parts))
+				for i, part := range e.Content.Parts {
+					if part.FunctionResponse != nil {
+						log.Printf("[authPreprocessor][%s]   part[%d] FunctionResponse name=%s id=%s", invID, i, part.FunctionResponse.Name, part.FunctionResponse.ID)
+					}
+					if part.FunctionCall != nil {
+						log.Printf("[authPreprocessor][%s]   part[%d] FunctionCall name=%s id=%s", invID, i, part.FunctionCall.Name, part.FunctionCall.ID)
+					}
+				}
 				events = append(events, e)
 			}
+		} else {
+			log.Printf("[authPreprocessor][%s] STEP 3: session is nil, skipping events", invID)
 		}
+		log.Printf("[authPreprocessor][%s] STEP 4: total events=%d", invID, len(events))
 
 		type authResp struct {
 			cfg    toolauth.AuthConfig
@@ -66,63 +83,88 @@ func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flo
 
 		for k := len(events) - 1; k >= 0; k-- {
 			event := events[k]
+			log.Printf("[authPreprocessor][%s] STEP 5: examining event[%d] id=%s author=%s", invID, k, event.ID, event.Author)
 			if event.Author != "user" {
+				log.Printf("[authPreprocessor][%s]   skip: author!=user", invID)
 				continue
 			}
 			responses := utils.FunctionResponses(event.Content)
+			log.Printf("[authPreprocessor][%s]   FunctionResponses count=%d", invID, len(responses))
 			if len(responses) == 0 {
-				return
+				continue
 			}
 			for _, funcResp := range responses {
+				log.Printf("[authPreprocessor][%s] STEP 6: funcResp name=%s id=%s (expect %s)", invID, funcResp.Name, funcResp.ID, toolauth.FunctionCallName)
 				if funcResp.Name != toolauth.FunctionCallName {
+					log.Printf("[authPreprocessor][%s]   skip: name mismatch", invID)
 					continue
 				}
+				log.Printf("[authPreprocessor][%s] STEP 7: found adk_request_credential response", invID)
 				var cfg toolauth.AuthConfig
 				if funcResp.Response != nil {
 					var respMap map[string]any
 					resp, hasResponseKey := funcResp.Response["response"]
+					log.Printf("[authPreprocessor][%s] STEP 8: parsing response hasResponseKey=%v responseKeys=%v", invID, hasResponseKey, mapKeysAny(funcResp.Response))
 					if hasResponseKey && len(funcResp.Response) == 1 {
 						if jsonString, ok := resp.(string); ok {
 							if err := json.Unmarshal([]byte(jsonString), &respMap); err != nil {
+								log.Printf("[authPreprocessor][%s] STEP 8 ERROR: unmarshal failed: %v", invID, err)
 								yield(nil, fmt.Errorf("auth preprocessor: failed to unmarshal auth response for event %q: %w", event.ID, err))
 								return
 							}
+							log.Printf("[authPreprocessor][%s]   unmarshaled from JSON string, respMap keys=%v", invID, mapKeysAny(respMap))
 						} else if m, ok := resp.(map[string]any); ok {
 							respMap = m
+							log.Printf("[authPreprocessor][%s]   response was map directly", invID)
 						} else {
+							log.Printf("[authPreprocessor][%s] STEP 8 ERROR: response key value type=%T not string or object", invID, resp)
 							yield(nil, fmt.Errorf("auth preprocessor: response key value is not string or object for event %q", event.ID))
 							return
 						}
 					} else {
 						respMap = funcResp.Response
+						log.Printf("[authPreprocessor][%s]   using funcResp.Response directly, keys=%v", invID, mapKeysAny(respMap))
 					}
 					var err error
 					cfg, err = toolauth.AuthConfigFromResponseMap(respMap)
 					if err != nil {
+						log.Printf("[authPreprocessor][%s] STEP 9 ERROR: AuthConfigFromResponseMap: %v", invID, err)
 						yield(nil, fmt.Errorf("auth preprocessor: %w", err))
 						return
 					}
+					log.Printf("[authPreprocessor][%s] STEP 9: AuthConfig parsed credential_key=%s", invID, cfg.CredentialKey)
+				} else {
+					log.Printf("[authPreprocessor][%s] STEP 8: funcResp.Response is nil", invID)
 				}
 				if ctx.Session() != nil {
+					log.Printf("[authPreprocessor][%s] STEP 10: calling ExchangeAndStore", invID)
 					if err := toolauth.ExchangeAndStore(ctx, cfg, ctx.Session().State()); err != nil {
+						log.Printf("[authPreprocessor][%s] STEP 10 ERROR: ExchangeAndStore: %v", invID, err)
 						yield(nil, fmt.Errorf("auth preprocessor: exchange and store failed: %w", err))
 						return
 					}
+					log.Printf("[authPreprocessor][%s] STEP 10: ExchangeAndStore succeeded", invID)
 				}
 				authResponses = append(authResponses, authResp{cfg: cfg, callID: funcResp.ID})
+				log.Printf("[authPreprocessor][%s] STEP 11: appended authResponse callID=%s", invID, funcResp.ID)
+				break
 			}
-			break
 		}
 
+		log.Printf("[authPreprocessor][%s] STEP 12: authResponses count=%d", invID, len(authResponses))
 		if len(authResponses) == 0 {
+			log.Printf("[authPreprocessor][%s] STEP 12: early exit, no auth responses to process", invID)
 			return
 		}
 
-		for _, ar := range authResponses {
+		for i, ar := range authResponses {
+			log.Printf("[authPreprocessor][%s] STEP 13: finding original tool call for authResponse[%d] callID=%s", invID, i, ar.callID)
 			originalCall := findOriginalToolCall(events, ar.callID)
 			if originalCall == nil {
+				log.Printf("[authPreprocessor][%s]   originalCall not found, skipping", invID)
 				continue
 			}
+			log.Printf("[authPreprocessor][%s] STEP 14: found originalCall name=%s id=%s, invoking handleFunctionCalls", invID, originalCall.Name, originalCall.ID)
 
 			ev, err := f.handleFunctionCalls(ctx, toolsmap, &model.LLMResponse{
 				Content: &genai.Content{
@@ -130,22 +172,47 @@ func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flo
 					Role:  genai.RoleUser,
 				},
 			}, nil)
+			if err != nil {
+				log.Printf("[authPreprocessor][%s] STEP 14 ERROR: handleFunctionCalls: %v", invID, err)
+			} else {
+				log.Printf("[authPreprocessor][%s] STEP 14: handleFunctionCalls succeeded", invID)
+			}
 			if !yield(ev, err) {
 				return
 			}
 		}
+		log.Printf("[authPreprocessor][%s] STEP 15: done", invID)
 	}
 }
 
+func mapKeys(m map[string]tool.Tool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func mapKeysAny(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func findOriginalToolCall(events []*session.Event, functionCallID string) *genai.FunctionCall {
+	log.Printf("[findOriginalToolCall] searching for functionCallID=%s (excluding %s)", functionCallID, toolauth.FunctionCallName)
 	for k := len(events) - 1; k >= 0; k-- {
 		calls := utils.FunctionCalls(events[k].Content)
 		for _, fc := range calls {
 			if fc.ID == functionCallID && fc.Name != toolauth.FunctionCallName {
+				log.Printf("[findOriginalToolCall] found at event[%d]: name=%s id=%s", k, fc.Name, fc.ID)
 				return fc
 			}
 		}
 	}
+	log.Printf("[findOriginalToolCall] not found for functionCallID=%s", functionCallID)
 	return nil
 }
 

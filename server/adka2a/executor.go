@@ -90,6 +90,7 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 //   - After the last session.Event is processed produce an empty TaskArtifactUpdateEvent{Append=true} with LastChunk=true,
 //     if at least one artifact update was produced during the run.
 //   - If there was an LLMResponse with non-zero error code, produce a TaskStatusUpdateEvent with TaskStateFailed.
+//     Else if StateDelta contains adk_auth_request_*, produce a TaskStatusUpdateEvent with TaskStateAuthRequired.
 //     Else if there was an LLMResponse with long-running tool invocation, produce a TaskStatusUpdateEvent with TaskStateInputRequired.
 //     Else produce a TaskStatusUpdateEvent with TaskStateCompleted.
 type Executor struct {

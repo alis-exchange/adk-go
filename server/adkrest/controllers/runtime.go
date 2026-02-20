@@ -15,18 +15,23 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
 	"time"
 
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/artifact"
 	"google.golang.org/adk/memory"
+	"google.golang.org/genai"
 	"google.golang.org/adk/runner"
 	"google.golang.org/adk/server/adkrest/internal/models"
 	"google.golang.org/adk/session"
+	"google.golang.org/adk/tool/toolauth"
 )
 
 // RuntimeAPIController is the controller for the Runtime API.
@@ -56,6 +61,14 @@ func (c *RuntimeAPIController) RunHandler(rw http.ResponseWriter, req *http.Requ
 	}
 	var events []models.Event
 	for _, event := range sessionEvents {
+		// Transform auth-required events for adk-web compatibility.
+		if toolauth.IsAuthRequired(event) {
+			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequest(event); ok {
+				if authEvent := toolauth.BuildAuthRequestEvent(event, fnCallID, authCfg); authEvent != nil {
+					event = authEvent
+				}
+			}
+		}
 		events = append(events, models.FromSessionEvent(*event))
 	}
 	EncodeJSONResponse(events, http.StatusOK, rw)
@@ -69,12 +82,19 @@ func (c *RuntimeAPIController) runAgent(ctx context.Context, runAgentRequest mod
 		return nil, err
 	}
 
+	msg := &runAgentRequest.NewMessage
+	if runAgentRequest.AuthCallbackUrl != "" {
+		if transformed := c.transformAuthCallback(ctx, runAgentRequest); transformed != nil {
+			msg = transformed
+		}
+	}
+
 	r, rCfg, err := c.getRunner(runAgentRequest)
 	if err != nil {
 		return nil, err
 	}
 
-	resp := r.Run(ctx, runAgentRequest.UserId, runAgentRequest.SessionId, &runAgentRequest.NewMessage, *rCfg)
+	resp := r.Run(ctx, runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg)
 
 	var events []*session.Event
 	for event, err := range resp {
@@ -110,12 +130,19 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 		return err
 	}
 
+	msg := &runAgentRequest.NewMessage
+	if runAgentRequest.AuthCallbackUrl != "" {
+		if transformed := c.transformAuthCallback(req.Context(), runAgentRequest); transformed != nil {
+			msg = transformed
+		}
+	}
+
 	r, rCfg, err := c.getRunner(runAgentRequest)
 	if err != nil {
 		return err
 	}
 
-	resp := r.Run(req.Context(), runAgentRequest.UserId, runAgentRequest.SessionId, &runAgentRequest.NewMessage, *rCfg)
+	resp := r.Run(req.Context(), runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg)
 
 	rw.WriteHeader(http.StatusOK)
 	for event, err := range resp {
@@ -130,6 +157,15 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 			}
 
 			continue
+		}
+		// Transform auth-required events (StateDelta with adk_auth_request_*)
+		// into adk_request_credential format for adk-web compatibility.
+		if toolauth.IsAuthRequired(event) {
+			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequest(event); ok {
+				if authEvent := toolauth.BuildAuthRequestEvent(event, fnCallID, authCfg); authEvent != nil {
+					event = authEvent
+				}
+			}
 		}
 		err := flashEvent(rc, rw, *event)
 		if err != nil {
@@ -157,6 +193,26 @@ func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event sessi
 		return newStatusError(fmt.Errorf("failed to flush: %w", err), http.StatusInternalServerError)
 	}
 	return nil
+}
+
+// transformAuthCallback fetches the session, finds a pending auth request in state,
+// and builds an adk_request_credential FunctionResponse message for authPreprocessor.
+// Returns nil if no pending auth or transform fails.
+func (c *RuntimeAPIController) transformAuthCallback(ctx context.Context, req models.RunAgentRequest) *genai.Content {
+	resp, err := c.sessionService.Get(ctx, &session.GetRequest{
+		AppName:   req.AppName,
+		UserID:    req.UserId,
+		SessionID: req.SessionId,
+	})
+	if err != nil || resp.Session == nil {
+		return nil
+	}
+	stateMap := maps.Collect(resp.Session.State().All())
+	fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(stateMap)
+	if !ok {
+		return nil
+	}
+	return toolauth.BuildAuthCallbackContent(fnCallID, authCfg, req.AuthCallbackUrl)
 }
 
 func (c *RuntimeAPIController) validateSessionExists(ctx context.Context, appName, userID, sessionID string) error {
@@ -202,12 +258,58 @@ func (c *RuntimeAPIController) getRunner(req models.RunAgentRequest) (*runner.Ru
 func decodeRequestBody(req *http.Request) (decodedReq models.RunAgentRequest, err error) {
 	var runAgentRequest models.RunAgentRequest
 	defer func() {
-		err = req.Body.Close()
+		_ = req.Body.Close()
 	}()
-	d := json.NewDecoder(req.Body)
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return runAgentRequest, newStatusError(fmt.Errorf("failed to read request body: %w", err), http.StatusBadRequest)
+	}
+	// Normalize adk-web snake_case part keys to genai camelCase (e.g. function_response -> functionResponse)
+	body = normalizeNewMessageParts(body)
+	d := json.NewDecoder(bytes.NewReader(body))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&runAgentRequest); err != nil {
 		return runAgentRequest, newStatusError(fmt.Errorf("failed to decode request: %w", err), http.StatusBadRequest)
 	}
+	// Allow authCallbackUrl from query param (for OAuth redirect when client reloads)
+	if q := req.URL.Query().Get("authCallbackUrl"); q != "" && runAgentRequest.AuthCallbackUrl == "" {
+		runAgentRequest.AuthCallbackUrl = q
+	}
 	return runAgentRequest, nil
+}
+
+// normalizeNewMessageParts fixes adk-web sending snake_case keys (function_response)
+// which genai.Part expects as camelCase (functionResponse). Also handles function_call.
+func normalizeNewMessageParts(body []byte) []byte {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+	newMsg, _ := raw["newMessage"].(map[string]any)
+	if newMsg == nil {
+		return body
+	}
+	parts, _ := newMsg["parts"].([]any)
+	if len(parts) == 0 {
+		return body
+	}
+	for _, p := range parts {
+		part, _ := p.(map[string]any)
+		if part == nil {
+			continue
+		}
+		if v, has := part["function_response"]; has && part["functionResponse"] == nil {
+			part["functionResponse"] = v
+			delete(part, "function_response")
+		}
+		if v, has := part["function_call"]; has && part["functionCall"] == nil {
+			part["functionCall"] = v
+			delete(part, "function_call")
+		}
+	}
+	normalized, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
+	return normalized
 }

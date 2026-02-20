@@ -32,6 +32,15 @@ type RunAgentRequest struct {
 	Streaming bool `json:"streaming,omitempty"`
 
 	StateDelta *map[string]any `json:"stateDelta,omitempty"`
+
+	// AuthCallbackUrl is the full OAuth redirect URL (e.g. from window.location.href)
+	// when the client loads after the OAuth provider redirect. When set, the handler
+	// transforms it into an adk_request_credential FunctionResponse for authPreprocessor.
+	AuthCallbackUrl string `json:"authCallbackUrl,omitempty"`
+
+	// FunctionCallEventId is sent by adk-web for OAuth callback requests (event ID of the
+	// auth request event). Accepted for compatibility; auth flow uses function_response.id.
+	FunctionCallEventId string `json:"functionCallEventId,omitempty"`
 }
 
 // AssertRunAgentRequestRequired checks if the required fields are not zero-ed

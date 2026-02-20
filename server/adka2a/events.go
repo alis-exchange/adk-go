@@ -234,14 +234,14 @@ func taskToEvent(ctx agent.InvocationContext, task *a2a.Task) (*session.Event, e
 		longRunningToolIDs = append(longRunningToolIDs, lrtIDs...)
 	}
 
-	isTerminal := task.Status.State.Terminal() || task.Status.State == a2a.TaskStateInputRequired
+	isTerminal := task.Status.State.Terminal() || task.Status.State == a2a.TaskStateInputRequired || task.Status.State == a2a.TaskStateAuthRequired
 	if len(parts) == 0 && !isTerminal {
 		return nil, nil
 	}
 	if len(parts) > 0 {
 		event.Content = genai.NewContentFromParts(parts, genai.RoleModel)
 	}
-	if task.Status.State == a2a.TaskStateInputRequired {
+	if task.Status.State == a2a.TaskStateInputRequired || task.Status.State == a2a.TaskStateAuthRequired {
 		event.LongRunningToolIDs = longRunningToolIDs
 	}
 	if err := processA2AMeta(task, event); err != nil {

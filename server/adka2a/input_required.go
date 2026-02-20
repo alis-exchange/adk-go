@@ -133,7 +133,7 @@ func handleInputRequired(reqCtx *a2asrv.RequestContext, content *genai.Content) 
 		return nil, nil
 	}
 	task, statusMsg := reqCtx.StoredTask, reqCtx.StoredTask.Status.Message
-	if task.Status.State != a2a.TaskStateInputRequired || statusMsg == nil {
+	if (task.Status.State != a2a.TaskStateInputRequired && task.Status.State != a2a.TaskStateAuthRequired) || statusMsg == nil {
 		return nil, nil
 	}
 
@@ -152,7 +152,7 @@ func handleInputRequired(reqCtx *a2asrv.RequestContext, content *genai.Content) 
 		if !hasMatchingResponse {
 			parts := makeInputMissingErrorMessage(statusMsg.Parts, statusPart.FunctionCall.ID)
 			msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx.StoredTask, parts...)
-			event := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateInputRequired, msg)
+			event := a2a.NewStatusUpdateEvent(reqCtx, task.Status.State, msg)
 			event.Final = true
 			return event, nil
 		}

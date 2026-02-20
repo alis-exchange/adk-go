@@ -102,15 +102,34 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("credential_key is required")
 	}
 
-	o2 := cfg.ExchangedAuthCredential
-	if o2 == nil || o2.OAuth2 == nil {
-		o2 = cfg.RawAuthCredential
-	}
-	if o2 == nil || o2.OAuth2 == nil {
+	ex := cfg.ExchangedAuthCredential
+	raw := cfg.RawAuthCredential
+	if (ex == nil || ex.OAuth2 == nil) && (raw == nil || raw.OAuth2 == nil) {
 		return fmt.Errorf("no oauth2 credential in auth config")
 	}
 
-	authRespURI := o2.OAuth2.AuthResponseURI
+	// Prefer exchanged for callback data (authResponseUri, redirect, state); fall back to raw for client_id/secret/token_uri.
+	var o2, rawO2 *OAuth2Credential
+	if ex != nil {
+		o2 = ex.OAuth2
+	}
+	if raw != nil {
+		rawO2 = raw.OAuth2
+	}
+	if o2 == nil {
+		o2 = rawO2
+	}
+	if rawO2 == nil {
+		rawO2 = o2
+	}
+	if o2 == nil {
+		return fmt.Errorf("no oauth2 credential in auth config")
+	}
+
+	authRespURI := ""
+	if ex != nil && ex.OAuth2 != nil {
+		authRespURI = ex.OAuth2.AuthResponseURI
+	}
 	if authRespURI == "" {
 		return fmt.Errorf("auth_response_uri is required for exchange")
 	}
@@ -124,7 +143,7 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("no code in auth_response_uri")
 	}
 
-	redirectURL := o2.OAuth2.RedirectURI
+	redirectURL := o2.RedirectURI
 	if redirectURL == "" {
 		// Use the auth_response_uri without query params as redirect (common pattern)
 		redirectURL = parsed.Scheme + "://" + parsed.Host + parsed.Path
@@ -133,18 +152,32 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		}
 	}
 
-	tokenURI := o2.OAuth2.TokenURI
+	tokenURI := o2.TokenURI
 	if tokenURI == "" {
-		// Default Google token endpoint
+		tokenURI = rawO2.TokenURI
+	}
+	if tokenURI == "" {
 		tokenURI = "https://oauth2.googleapis.com/token"
 	}
 
+	clientID := o2.ClientID
+	if clientID == "" {
+		clientID = rawO2.ClientID
+	}
+	clientSecret := o2.ClientSecret
+	if clientSecret == "" {
+		clientSecret = rawO2.ClientSecret
+	}
+	if clientID == "" || clientSecret == "" {
+		return fmt.Errorf("client_id and client_secret are required (from exchangedAuthCredential or rawAuthCredential)")
+	}
+
 	config := oauth2.Config{
-		ClientID:     o2.OAuth2.ClientID,
-		ClientSecret: o2.OAuth2.ClientSecret,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 		RedirectURL:  redirectURL,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  o2.OAuth2.AuthURI,
+			AuthURL:  o2.AuthURI,
 			TokenURL: tokenURI,
 		},
 	}
