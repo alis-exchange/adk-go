@@ -12,8 +12,11 @@ import (
 	"google.golang.org/adk/session"
 )
 
-// AuthConfigFromResponseMap parses a map (e.g. from FunctionResponse) into AuthConfig.
-// Accepts both camelCase (adk-web) and snake_case keys for compatibility.
+// AuthConfigFromResponseMap parses a map (e.g. from a FunctionResponse.Response) into an
+// AuthConfig struct. This is used by authPreprocessor to convert the client's OAuth callback
+// payload into a typed config. Accepts both camelCase (adk-web, a2a-playground) and snake_case
+// keys since different clients may use different conventions. The normalization step converts
+// all keys to snake_case before JSON unmarshaling into the struct.
 func AuthConfigFromResponseMap(m map[string]any) (AuthConfig, error) {
 	if m == nil {
 		return AuthConfig{}, fmt.Errorf("auth response map is nil")
@@ -46,8 +49,9 @@ func normalizeAuthConfigKeys(m map[string]any) map[string]any {
 	return out
 }
 
+// camelToSnake maps known camelCase auth config keys to snake_case. This is a
+// lookup table for supported keys, not a generic converter.
 func camelToSnake(s string) string {
-	// Map known camelCase keys to snake_case for auth config
 	switch s {
 	case "credentialKey":
 		return "credential_key"
@@ -92,8 +96,29 @@ func camelToSnake(s string) string {
 	}
 }
 
-// ExchangeAndStore parses the auth_response_uri for the authorization code,
-// exchanges it for a token, and stores the resulting credential in session state.
+// ExchangeAndStore completes the server-side OAuth token exchange and persists the result.
+//
+// This is the critical step between the user completing the OAuth popup and the tool being
+// re-invoked with valid credentials. It is called by authPreprocessor (for REST/adk-web)
+// and by the A2A event conversion layer.
+//
+// ## Credential Resolution
+//
+// The AuthConfig may carry credentials in two places:
+//   - ExchangedAuthCredential: populated by the client with callback data (authResponseUri,
+//     redirectUri). This is the "live" data from the current OAuth flow.
+//   - RawAuthCredential: the static config originally provided by the tool (client_id,
+//     client_secret, token_uri, scopes). These values don't change between flows.
+//
+// The function merges both: it takes callback-specific fields from ExchangedAuthCredential
+// and falls back to RawAuthCredential for client_id, client_secret, and token_uri. This is
+// necessary because some clients (e.g. a2a-playground) include rawAuthCredential with the
+// static secrets, while exchangedAuthCredential only has the callback URL.
+//
+// ## Token Storage
+//
+// The resulting access/refresh tokens are stored in session state at key
+// "temp:<credentialKey>". Tools retrieve this via GetCredential on subsequent calls.
 func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) error {
 	if state == nil {
 		return fmt.Errorf("session state is nil")
@@ -108,7 +133,10 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("no oauth2 credential in auth config")
 	}
 
-	// Prefer exchanged for callback data (authResponseUri, redirect, state); fall back to raw for client_id/secret/token_uri.
+	// Merge exchanged and raw credentials:
+	// - o2 = primary source (exchanged), used for callback-specific fields (authResponseUri, redirectUri)
+	// - rawO2 = fallback source (raw), used for static fields (client_id, client_secret, token_uri)
+	// If either is nil, the other serves as both primary and fallback.
 	var o2, rawO2 *OAuth2Credential
 	if ex != nil {
 		o2 = ex.OAuth2
@@ -126,6 +154,8 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("no oauth2 credential in auth config")
 	}
 
+	// Extract auth_response_uri from the exchanged credential. This is the full URL
+	// the OAuth provider redirected to (e.g. http://localhost:3000/oauth-callback?code=abc&state=xyz).
 	authRespURI := ""
 	if ex != nil && ex.OAuth2 != nil {
 		authRespURI = ex.OAuth2.AuthResponseURI
@@ -134,6 +164,7 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("auth_response_uri is required for exchange")
 	}
 
+	// Parse the authorization code from the callback URL's query parameters.
 	parsed, err := url.Parse(authRespURI)
 	if err != nil {
 		return fmt.Errorf("invalid auth_response_uri: %w", err)
@@ -143,15 +174,18 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		return fmt.Errorf("no code in auth_response_uri")
 	}
 
+	// The redirect_uri must match exactly what was used in the initial authorization request,
+	// otherwise the token exchange will fail. Prefer the explicit redirectUri if provided;
+	// fall back to deriving it from auth_response_uri by stripping query parameters.
 	redirectURL := o2.RedirectURI
 	if redirectURL == "" {
-		// Use the auth_response_uri without query params as redirect (common pattern)
 		redirectURL = parsed.Scheme + "://" + parsed.Host + parsed.Path
 		if parsed.Path == "" && parsed.RawQuery != "" {
 			redirectURL = parsed.Scheme + "://" + parsed.Host + "/"
 		}
 	}
 
+	// Resolve token_uri with fallback chain: exchanged -> raw -> Google default.
 	tokenURI := o2.TokenURI
 	if tokenURI == "" {
 		tokenURI = rawO2.TokenURI
@@ -160,6 +194,9 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		tokenURI = "https://oauth2.googleapis.com/token"
 	}
 
+	// Resolve client credentials with fallback from exchanged to raw. The raw credential
+	// is the authoritative source for client_id and client_secret since these are configured
+	// by the tool and don't change during the OAuth flow.
 	clientID := o2.ClientID
 	if clientID == "" {
 		clientID = rawO2.ClientID
@@ -182,12 +219,14 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 		},
 	}
 
+	// Perform the actual OAuth2 authorization code exchange with the token endpoint.
 	tok, err := config.Exchange(ctx, code)
 	if err != nil {
 		return fmt.Errorf("oauth2 exchange failed: %w", err)
 	}
 
-	// Store the token as AuthCredential for tools to read
+	// Persist the token in session state. Tools call GetCredential(credentialKey) which
+	// reads from CredentialStatePrefix+credentialKey ("temp:<key>") to get these tokens.
 	cred := AuthCredential{
 		OAuth2: &OAuth2Credential{
 			AccessToken:  tok.AccessToken,
@@ -199,12 +238,15 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 	if err != nil {
 		return fmt.Errorf("marshal credential: %w", err)
 	}
-	// Store as JSON string for consistent retrieval
 	return state.Set(CredentialStatePrefix+cfg.CredentialKey, string(data))
 }
 
-// ExchangeAndStoreServiceAccount uses a service account JSON key to obtain an
-// access token and stores it in session state. No user interaction required.
+// ExchangeAndStoreServiceAccount provides a non-interactive credential flow for tools that
+// use Google service account authentication. Unlike ExchangeAndStore (which handles the
+// OAuth authorization code flow and requires user interaction), this function takes the
+// service account JSON key from RawAuthCredential.ServiceAccount, obtains an access token
+// directly using Google's credentials API, and stores it in session state. This is useful
+// for server-to-server authentication where no user consent is needed.
 func ExchangeAndStoreServiceAccount(ctx context.Context, cfg AuthConfig, state session.State) error {
 	if state == nil {
 		return fmt.Errorf("session state is nil")

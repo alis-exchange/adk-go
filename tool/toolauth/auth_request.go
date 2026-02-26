@@ -24,8 +24,15 @@ import (
 	"google.golang.org/genai"
 )
 
-// GenerateAuthRequest builds the auth URL and populates ExchangedAuthCredential
-// with AuthURI and State. Returns the updated AuthConfig for the tool to put in StateDelta.
+// GenerateAuthRequest constructs the OAuth authorization URL that the client will open in a
+// popup. It reads the client_id, redirect_uri, scopes, and endpoint URLs from the
+// RawAuthCredential in the config, then uses oauth2.Config.AuthCodeURL to build the full
+// authorization URL with state parameter. The resulting URL is stored in
+// ExchangedAuthCredential.OAuth2.AuthURI so the REST/A2A layer can include it in the
+// adk_request_credential FunctionCall sent to the client.
+//
+// The returned AuthConfig is the input config augmented with ExchangedAuthCredential; the
+// caller (typically a CredentialHelper) stores this in StateDelta for downstream processing.
 func GenerateAuthRequest(cfg AuthConfig) (AuthConfig, error) {
 	raw := cfg.RawAuthCredential
 	if raw == nil || raw.OAuth2 == nil {
@@ -78,8 +85,11 @@ func GenerateAuthRequest(cfg AuthConfig) (AuthConfig, error) {
 	return out, nil
 }
 
-// IsAuthRequired returns true if the event indicates an auth request (tool returned
-// "Pending User Authorization" and set StateDelta with auth config).
+// IsAuthRequired returns true if the event contains a pending auth request in its StateDelta.
+// When a tool calls RequestCredential and no stored credential is found, the CredentialHelper
+// stores the auth config in StateDelta under a key prefixed with "adk_auth_request_". This
+// function checks for the presence of such keys, indicating the event should be transformed
+// into an adk_request_credential FunctionCall for the client.
 func IsAuthRequired(event *session.Event) bool {
 	if event == nil || event.Actions.StateDelta == nil {
 		return false
@@ -92,8 +102,11 @@ func IsAuthRequired(event *session.Event) bool {
 	return false
 }
 
-// ExtractAuthRequest finds the auth request in StateDelta and returns the
-// functionCallID and AuthConfig. ok is false if none found.
+// ExtractAuthRequest extracts the pending auth request from an event's StateDelta. The key
+// format is "adk_auth_request_<functionCallID>" and the value is the AuthConfig (as a map,
+// pointer, or value). The functionCallID links back to the original tool FunctionCall that
+// requested credentials, enabling the preprocessor to re-invoke that tool after token exchange.
+// Returns ok=false if no auth request key is found in StateDelta.
 func ExtractAuthRequest(event *session.Event) (functionCallID string, authConfig AuthConfig, ok bool) {
 	if event == nil || event.Actions.StateDelta == nil {
 		return "", AuthConfig{}, false
@@ -130,8 +143,10 @@ func ExtractAuthRequest(event *session.Event) (functionCallID string, authConfig
 	return "", AuthConfig{}, false
 }
 
-// ExtractAuthRequestFromState finds a pending auth request in session state
-// (same structure as StateDelta) and returns functionCallID and AuthConfig.
+// ExtractAuthRequestFromState is like ExtractAuthRequest but reads from a session state map
+// instead of an event's StateDelta. This is used by the A2A layer when processing incoming
+// messages: after events are committed, the auth config is available in session state (since
+// StateDelta gets merged into state). Returns ok=false if no auth request key is found.
 func ExtractAuthRequestFromState(state map[string]any) (functionCallID string, authConfig AuthConfig, ok bool) {
 	if state == nil {
 		return "", AuthConfig{}, false
@@ -168,10 +183,19 @@ func ExtractAuthRequestFromState(state map[string]any) (functionCallID string, a
 	return "", AuthConfig{}, false
 }
 
-// BuildAuthRequestContentFromConfig builds genai.Content and LongRunningToolIDs
-// for the adk_request_credential flow from an existing auth config (e.g. from
-// StateDelta). Uses authConfig as-is when ExchangedAuthCredential is present.
-// Fallback to GenerateAuthRequest only when ExchangedAuthCredential is empty.
+// BuildAuthRequestContentFromConfig builds the genai.Content that represents an
+// adk_request_credential FunctionCall for the client. This is used by the A2A
+// authRequiredProcessor to emit auth-required events with the OAuth URL.
+//
+// The content contains a single FunctionCall part with:
+//   - Name: "adk_request_credential"
+//   - ID: the original tool's functionCallID (for correlation on callback)
+//   - Args: {functionCallId, authConfig} with camelCase keys for client compatibility
+//
+// If the auth config already has a fully populated ExchangedAuthCredential with an authUri,
+// it is used as-is. Otherwise, GenerateAuthRequest is called to build the OAuth URL from
+// the raw credential. Returns the content and a list of long-running tool IDs (the
+// functionCallID) which signals to the client that this call requires user interaction.
 func BuildAuthRequestContentFromConfig(functionCallID string, authConfig AuthConfig) (*genai.Content, []string) {
 	cfg := authConfig
 	if cfg.ExchangedAuthCredential == nil || cfg.ExchangedAuthCredential.OAuth2 == nil ||
@@ -199,9 +223,17 @@ func BuildAuthRequestContentFromConfig(functionCallID string, authConfig AuthCon
 	return content, []string{functionCallID}
 }
 
-// BuildAuthCallbackContent builds genai.Content for the OAuth callback: a user
-// message with a FunctionResponse for adk_request_credential containing the
-// callback URL. authPreprocessor will find this and run ExchangeAndStore.
+// BuildAuthCallbackContent constructs the user message that represents the OAuth callback.
+// This is used by the A2A event conversion layer when converting an incoming A2A message
+// (containing the auth callback URL) into a genai.Content for the runner.
+//
+// The content is a FunctionResponse with name="adk_request_credential" that carries the full
+// auth config including the auth_response_uri (callback URL with ?code=...). When the runner
+// processes this message, authPreprocessor will detect the FunctionResponse, call
+// ExchangeAndStore to exchange the code for tokens, and re-invoke the original tool.
+//
+// The response payload is serialized as a snake_case map for compatibility with
+// AuthConfigFromResponseMap which normalizes both camelCase and snake_case keys.
 func BuildAuthCallbackContent(functionCallID string, authConfig AuthConfig, callbackURL string) *genai.Content {
 	cfg := authConfig
 	if cfg.ExchangedAuthCredential == nil {
@@ -233,10 +265,18 @@ func BuildAuthCallbackContent(functionCallID string, authConfig AuthConfig, call
 	}
 }
 
-// BuildAuthRequestEvent builds a session.Event for the adk_request_credential
-// flow. Uses camelCase keys (authConfig, exchangedAuthCredential, authUri, etc.)
-// to match adk-web expectations. Returns nil if auth config cannot be built.
-// The invocationID is taken from the source event for proper correlation.
+// BuildAuthRequestEvent builds a session.Event representing the adk_request_credential
+// FunctionCall for the REST (adk-web) flow. Unlike BuildAuthRequestContentFromConfig (used
+// by A2A), this produces a full session.Event that replaces the original tool-response event
+// in the SSE/REST response stream.
+//
+// The event preserves the source event's ID, branch, timestamp, and invocationID so the
+// client can correlate the auth request with the original invocation. The LLMResponse.Content
+// contains the adk_request_credential FunctionCall with camelCase keys matching adk-web's
+// expected format. LongRunningToolIDs signals that this event requires user interaction
+// (the OAuth popup) before the flow can continue.
+//
+// Returns nil if GenerateAuthRequest fails (e.g. missing required fields in raw credential).
 func BuildAuthRequestEvent(sourceEvent *session.Event, functionCallID string, authConfig AuthConfig) *session.Event {
 	cfg, err := GenerateAuthRequest(authConfig)
 	if err != nil {
@@ -273,6 +313,8 @@ func BuildAuthRequestEvent(sourceEvent *session.Event, functionCallID string, au
 	return ev
 }
 
+// toFrontendAuthConfigMap converts AuthConfig to a map with camelCase keys for
+// adk-web and other clients that expect JavaScript-style property names.
 func toFrontendAuthConfigMap(cfg AuthConfig) map[string]any {
 	out := make(map[string]any)
 	if cfg.CredentialKey != "" {
@@ -291,6 +333,7 @@ func toFrontendAuthConfigMap(cfg AuthConfig) map[string]any {
 	return out
 }
 
+// oauth2CredToFrontendMap converts OAuth2Credential fields to camelCase map keys.
 func oauth2CredToFrontendMap(o *OAuth2Credential) map[string]any {
 	if o == nil {
 		return nil

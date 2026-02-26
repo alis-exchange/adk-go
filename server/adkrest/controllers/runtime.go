@@ -61,7 +61,9 @@ func (c *RuntimeAPIController) RunHandler(rw http.ResponseWriter, req *http.Requ
 	}
 	var events []models.Event
 	for _, event := range sessionEvents {
-		// Transform auth-required events for adk-web compatibility.
+		// Transform auth-required events: when a tool stored auth config in StateDelta,
+		// replace the event's content with an adk_request_credential FunctionCall that
+		// adk-web knows how to display (OAuth popup trigger).
 		if toolauth.IsAuthRequired(event) {
 			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequest(event); ok {
 				if authEvent := toolauth.BuildAuthRequestEvent(event, fnCallID, authCfg); authEvent != nil {
@@ -195,9 +197,21 @@ func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event sessi
 	return nil
 }
 
-// transformAuthCallback fetches the session, finds a pending auth request in state,
-// and builds an adk_request_credential FunctionResponse message for authPreprocessor.
-// Returns nil if no pending auth or transform fails.
+// transformAuthCallback converts an OAuth callback URL into a genai.Content message that
+// authPreprocessor can process. This bridges the gap between the adk-web client (which sends
+// the callback URL as a simple authCallbackUrl field) and the internal auth protocol (which
+// expects an adk_request_credential FunctionResponse).
+//
+// The flow:
+//  1. adk-web completes OAuth and reloads with ?authCallbackUrl=<url with code>.
+//  2. decodeRequestBody reads authCallbackUrl from the query param or request body.
+//  3. This function fetches the session to find the pending auth request (stored in state
+//     by the previous invocation's StateDelta).
+//  4. Builds a FunctionResponse with the auth config + callback URL.
+//  5. The runner processes this message through authPreprocessor which exchanges the code
+//     for tokens and re-invokes the original tool.
+//
+// Returns nil if no pending auth request exists in session state (normal request path).
 func (c *RuntimeAPIController) transformAuthCallback(ctx context.Context, req models.RunAgentRequest) *genai.Content {
 	resp, err := c.sessionService.Get(ctx, &session.GetRequest{
 		AppName:   req.AppName,
@@ -255,6 +269,17 @@ func (c *RuntimeAPIController) getRunner(req models.RunAgentRequest) (*runner.Ru
 	}, nil
 }
 
+// decodeRequestBody reads, normalizes, and parses the RunAgentRequest from an HTTP request.
+//
+// Two normalization steps are applied before decoding:
+//
+//  1. normalizeNewMessageParts converts snake_case part keys to camelCase. This is needed
+//     because adk-web's JavaScript sends "function_response" and "function_call" but
+//     genai.Part's JSON tags expect "functionResponse" and "functionCall".
+//
+//  2. authCallbackUrl can be provided via query parameter (?authCallbackUrl=...) as a
+//     fallback. This supports the OAuth redirect flow where the browser reloads the page
+//     and the callback URL may not be in the JSON body.
 func decodeRequestBody(req *http.Request) (decodedReq models.RunAgentRequest, err error) {
 	var runAgentRequest models.RunAgentRequest
 	defer func() {
@@ -264,22 +289,23 @@ func decodeRequestBody(req *http.Request) (decodedReq models.RunAgentRequest, er
 	if err != nil {
 		return runAgentRequest, newStatusError(fmt.Errorf("failed to read request body: %w", err), http.StatusBadRequest)
 	}
-	// Normalize adk-web snake_case part keys to genai camelCase (e.g. function_response -> functionResponse)
 	body = normalizeNewMessageParts(body)
 	d := json.NewDecoder(bytes.NewReader(body))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&runAgentRequest); err != nil {
 		return runAgentRequest, newStatusError(fmt.Errorf("failed to decode request: %w", err), http.StatusBadRequest)
 	}
-	// Allow authCallbackUrl from query param (for OAuth redirect when client reloads)
 	if q := req.URL.Query().Get("authCallbackUrl"); q != "" && runAgentRequest.AuthCallbackUrl == "" {
 		runAgentRequest.AuthCallbackUrl = q
 	}
 	return runAgentRequest, nil
 }
 
-// normalizeNewMessageParts fixes adk-web sending snake_case keys (function_response)
-// which genai.Part expects as camelCase (functionResponse). Also handles function_call.
+// normalizeNewMessageParts fixes a serialization mismatch between adk-web and the Go genai SDK.
+// adk-web's JavaScript sends message parts with snake_case keys ("function_response",
+// "function_call") because the Python protobuf JSON serialization uses that convention.
+// However, genai.Part in Go uses camelCase JSON tags ("functionResponse", "functionCall").
+// This function rewrites the keys in-place before JSON decoding to bridge the two conventions.
 func normalizeNewMessageParts(body []byte) []byte {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {

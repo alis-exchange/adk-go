@@ -133,6 +133,8 @@ func handleInputRequired(reqCtx *a2asrv.RequestContext, content *genai.Content) 
 		return nil, nil
 	}
 	task, statusMsg := reqCtx.StoredTask, reqCtx.StoredTask.Status.Message
+	// Auth-required tasks use the same flow as input-required: both wait for a
+	// client response (OAuth callback or tool input) before resuming.
 	if (task.Status.State != a2a.TaskStateInputRequired && task.Status.State != a2a.TaskStateAuthRequired) || statusMsg == nil {
 		return nil, nil
 	}

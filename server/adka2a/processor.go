@@ -26,14 +26,34 @@ import (
 	"google.golang.org/adk/session"
 )
 
+// eventProcessor converts ADK session events into A2A protocol events (artifacts and status
+// updates). It processes events one at a time, accumulating terminal states that are emitted
+// at the end via makeFinalStatusUpdate.
+//
+// ## Processing Pipeline
+//
+// Each event passes through this sequence:
+//  1. updateTerminalActions: tracks escalation and agent-transfer actions across all events.
+//  2. Error check: if the LLM response contains an error, a failedEvent is recorded.
+//  3. authRequiredProcessor: checks for auth requests in StateDelta (adk_auth_request_*).
+//  4. inputRequiredProcessor: checks for long-running tool calls (LongRunningToolIDs).
+//  5. Part conversion: converts genai.Parts to A2A-native parts for artifact updates.
+//
+// ## Terminal Status Priority
+//
+// Multiple terminal conditions can be detected during a single invocation. The final status
+// is determined by priority: failed > authRequired > inputRequired > completed. This ensures
+// that errors always surface, auth requirements take precedence over input requirements
+// (since auth must be resolved before the tool can produce meaningful output), and completed
+// is only used when no other terminal condition was detected.
 type eventProcessor struct {
 	reqCtx        *a2asrv.RequestContext
 	meta          invocationMeta
 	partConverter GenAIPartConverter
 
-	// terminalActions is used to keep track of escalate and agent transfer actions on processed events.
-	// It is then gets passed to caller through with metadata of a terminal event.
-	// This is done to make sure the caller processes it, since intermediate events without parts might be ignored.
+	// terminalActions tracks escalate and agent transfer actions across all processed events.
+	// Attached to the final terminal event's metadata so the caller can act on them, since
+	// intermediate events without parts may be skipped.
 	terminalActions session.EventActions
 
 	// responseID is created once the first TaskArtifactUpdateEvent is sent. Used for subsequent artifact updates.
@@ -44,16 +64,15 @@ type eventProcessor struct {
 	// invocation effectively erasing its parts.
 	partialResponseID a2a.ArtifactID
 
-	// failedEvent is used to postpone sending a terminal event until the whole ADK response is saved as an A2A artifact.
-	// Will be sent as the final Task status update if not nil.
+	// failedEvent records an LLM error. Highest priority terminal state.
 	failedEvent *a2a.TaskStatusUpdateEvent
 
-	// authRequiredProcessor handles auth-required events signaled via StateDelta (adk_auth_request_*).
-	// authRequiredProcessor.event will be sent as the final Task status update if failedEvent is nil.
+	// authRequiredProcessor detects tool auth requests (StateDelta with adk_auth_request_*).
+	// Its event, if set, is the second-highest priority terminal state.
 	authRequiredProcessor *authRequiredProcessor
 
-	// inputRequiredProcessor is used to postpone sending input-required in response to long-running function tool calls.
-	// inputRequiredProcessor.event will be sent as the final Task status update if failedEvent and authRequiredProcessor.event are nil.
+	// inputRequiredProcessor detects long-running tool calls that need user input.
+	// Its event, if set, is the third-highest priority terminal state.
 	inputRequiredProcessor *inputRequiredProcessor
 }
 
@@ -165,6 +184,12 @@ func (p *eventProcessor) makeFinalArtifactUpdate() *a2a.TaskArtifactUpdateEvent 
 	return ev
 }
 
+// makeFinalStatusUpdate returns the terminal status update for the A2A task. This is called
+// once after all events have been processed. The priority order ensures correct behavior:
+//   - failed: LLM returned an error; the task cannot continue.
+//   - authRequired: a tool needs OAuth credentials; the client should open the auth popup.
+//   - inputRequired: a long-running tool needs user input before completing.
+//   - completed: all tools ran successfully and the agent produced a final response.
 func (p *eventProcessor) makeFinalStatusUpdate() *a2a.TaskStatusUpdateEvent {
 	for _, event := range []*a2a.TaskStatusUpdateEvent{p.failedEvent, p.authRequiredProcessor.event, p.inputRequiredProcessor.event} {
 		if event != nil {

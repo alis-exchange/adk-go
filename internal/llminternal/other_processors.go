@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"log"
 
 	"google.golang.org/genai"
 
@@ -45,35 +44,60 @@ func codeExecutionRequestProcessor(ctx agent.InvocationContext, req *model.LLMRe
 	return func(yield func(*session.Event, error) bool) {}
 }
 
+// authPreprocessor handles the server-side OAuth callback in the adk_request_credential protocol.
+//
+// ## Protocol Overview
+//
+// When a tool needs user authorization (e.g. OAuth), it calls CredentialHelper.RequestCredential
+// which stores auth config in StateDelta under the key "adk_auth_request_<functionCallID>".
+// The REST layer (or A2A processor) transforms this into an adk_request_credential FunctionCall
+// event that clients recognize. The client opens an OAuth popup, the user signs in, and the
+// client sends back a FunctionResponse with name="adk_request_credential" containing the
+// auth config with authResponseUri (the callback URL with ?code=...).
+//
+// ## What This Preprocessor Does
+//
+// On the next invocation (after the client sends the OAuth callback), this preprocessor runs
+// before the LLM is called and:
+//
+//  1. Scans session events (newest first) for a user-authored FunctionResponse named
+//     "adk_request_credential". This is the OAuth callback from the client.
+//
+//  2. Parses the auth config from the response. Clients may send the config in different
+//     formats: (a) directly as the FunctionResponse.Response map, (b) wrapped in a "response"
+//     key as a JSON string, or (c) wrapped in a "response" key as a nested map. All three
+//     formats are supported.
+//
+//  3. Calls ExchangeAndStore which extracts the authorization code from auth_response_uri,
+//     exchanges it with the OAuth provider for access/refresh tokens, and stores the
+//     resulting credential in session state at "temp:<credentialKey>".
+//
+//  4. Finds the original tool FunctionCall (e.g. get_user_info) that triggered the auth
+//     request by matching the functionCallID. The adk_request_credential FunctionResponse
+//     uses the same ID as the original tool call.
+//
+//  5. Re-invokes that original tool via handleFunctionCalls. This time, the tool's
+//     GetCredential call will find the stored token and complete successfully.
+//
+// If no adk_request_credential FunctionResponse is found (normal invocations without OAuth
+// callback), the preprocessor returns immediately without yielding any events.
 func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error] {
-	invID := ctx.InvocationID()
-	log.Printf("[authPreprocessor][%s] STEP 1: entered", invID)
-
 	return func(yield func(*session.Event, error) bool) {
+		// Build a lookup map of available tools so we can re-invoke the original
+		// tool after storing credentials.
 		toolsmap := make(map[string]tool.Tool)
 		for _, t := range f.Tools {
 			toolsmap[t.Name()] = t
 		}
-		log.Printf("[authPreprocessor][%s] STEP 2: tools loaded, count=%d, names=%v", invID, len(toolsmap), mapKeys(toolsmap))
 
+		// Collect all session events. We need the full history to find both the
+		// OAuth callback (FunctionResponse) and the original tool call (FunctionCall).
 		var events []*session.Event
 		if ctx.Session() != nil {
 			for e := range ctx.Session().Events().All() {
-				log.Printf("[authPreprocessor][%s] STEP 3: event id=%s author=%s parts=%d", invID, e.ID, e.Author, len(e.Content.Parts))
-				for i, part := range e.Content.Parts {
-					if part.FunctionResponse != nil {
-						log.Printf("[authPreprocessor][%s]   part[%d] FunctionResponse name=%s id=%s", invID, i, part.FunctionResponse.Name, part.FunctionResponse.ID)
-					}
-					if part.FunctionCall != nil {
-						log.Printf("[authPreprocessor][%s]   part[%d] FunctionCall name=%s id=%s", invID, i, part.FunctionCall.Name, part.FunctionCall.ID)
-					}
-				}
 				events = append(events, e)
 			}
-		} else {
-			log.Printf("[authPreprocessor][%s] STEP 3: session is nil, skipping events", invID)
 		}
-		log.Printf("[authPreprocessor][%s] STEP 4: total events=%d", invID, len(events))
 
 		type authResp struct {
 			cfg    toolauth.AuthConfig
@@ -81,138 +105,119 @@ func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flo
 		}
 		var authResponses []authResp
 
+		// Walk events from most recent to oldest. The OAuth callback FunctionResponse
+		// will be in a recent user-authored event. We only look at user events because
+		// the client sends the callback as a user message.
 		for k := len(events) - 1; k >= 0; k-- {
 			event := events[k]
-			log.Printf("[authPreprocessor][%s] STEP 5: examining event[%d] id=%s author=%s", invID, k, event.ID, event.Author)
 			if event.Author != "user" {
-				log.Printf("[authPreprocessor][%s]   skip: author!=user", invID)
 				continue
 			}
 			responses := utils.FunctionResponses(event.Content)
-			log.Printf("[authPreprocessor][%s]   FunctionResponses count=%d", invID, len(responses))
 			if len(responses) == 0 {
 				continue
 			}
 			for _, funcResp := range responses {
-				log.Printf("[authPreprocessor][%s] STEP 6: funcResp name=%s id=%s (expect %s)", invID, funcResp.Name, funcResp.ID, toolauth.FunctionCallName)
+				// Only process adk_request_credential responses (OAuth callbacks).
 				if funcResp.Name != toolauth.FunctionCallName {
-					log.Printf("[authPreprocessor][%s]   skip: name mismatch", invID)
 					continue
 				}
-				log.Printf("[authPreprocessor][%s] STEP 7: found adk_request_credential response", invID)
+
+				// Parse the auth config from the FunctionResponse payload.
 				var cfg toolauth.AuthConfig
 				if funcResp.Response != nil {
 					var respMap map[string]any
+
+					// Handle multiple response formats from different clients:
+					// - adk-web wraps the auth config in a "response" key (as JSON string or map)
+					// - a2a-playground sends the auth config directly in the response map
 					resp, hasResponseKey := funcResp.Response["response"]
-					log.Printf("[authPreprocessor][%s] STEP 8: parsing response hasResponseKey=%v responseKeys=%v", invID, hasResponseKey, mapKeysAny(funcResp.Response))
 					if hasResponseKey && len(funcResp.Response) == 1 {
+						// Wrapped format: {"response": <string or map>}
 						if jsonString, ok := resp.(string); ok {
 							if err := json.Unmarshal([]byte(jsonString), &respMap); err != nil {
-								log.Printf("[authPreprocessor][%s] STEP 8 ERROR: unmarshal failed: %v", invID, err)
 								yield(nil, fmt.Errorf("auth preprocessor: failed to unmarshal auth response for event %q: %w", event.ID, err))
 								return
 							}
-							log.Printf("[authPreprocessor][%s]   unmarshaled from JSON string, respMap keys=%v", invID, mapKeysAny(respMap))
 						} else if m, ok := resp.(map[string]any); ok {
 							respMap = m
-							log.Printf("[authPreprocessor][%s]   response was map directly", invID)
 						} else {
-							log.Printf("[authPreprocessor][%s] STEP 8 ERROR: response key value type=%T not string or object", invID, resp)
 							yield(nil, fmt.Errorf("auth preprocessor: response key value is not string or object for event %q", event.ID))
 							return
 						}
 					} else {
+						// Direct format: the response map IS the auth config
 						respMap = funcResp.Response
-						log.Printf("[authPreprocessor][%s]   using funcResp.Response directly, keys=%v", invID, mapKeysAny(respMap))
 					}
+
+					// Normalize camelCase/snake_case keys and parse into AuthConfig struct.
 					var err error
 					cfg, err = toolauth.AuthConfigFromResponseMap(respMap)
 					if err != nil {
-						log.Printf("[authPreprocessor][%s] STEP 9 ERROR: AuthConfigFromResponseMap: %v", invID, err)
 						yield(nil, fmt.Errorf("auth preprocessor: %w", err))
 						return
 					}
-					log.Printf("[authPreprocessor][%s] STEP 9: AuthConfig parsed credential_key=%s", invID, cfg.CredentialKey)
-				} else {
-					log.Printf("[authPreprocessor][%s] STEP 8: funcResp.Response is nil", invID)
 				}
+
+				// Exchange the authorization code for tokens and store in session state.
+				// After this, tools calling GetCredential will find the stored token.
 				if ctx.Session() != nil {
-					log.Printf("[authPreprocessor][%s] STEP 10: calling ExchangeAndStore", invID)
 					if err := toolauth.ExchangeAndStore(ctx, cfg, ctx.Session().State()); err != nil {
-						log.Printf("[authPreprocessor][%s] STEP 10 ERROR: ExchangeAndStore: %v", invID, err)
 						yield(nil, fmt.Errorf("auth preprocessor: exchange and store failed: %w", err))
 						return
 					}
-					log.Printf("[authPreprocessor][%s] STEP 10: ExchangeAndStore succeeded", invID)
 				}
 				authResponses = append(authResponses, authResp{cfg: cfg, callID: funcResp.ID})
-				log.Printf("[authPreprocessor][%s] STEP 11: appended authResponse callID=%s", invID, funcResp.ID)
+				// Only process the first (most recent) auth callback per invocation.
 				break
 			}
 		}
 
-		log.Printf("[authPreprocessor][%s] STEP 12: authResponses count=%d", invID, len(authResponses))
+		// No OAuth callback found; this is a normal invocation. Return without
+		// yielding events so the flow proceeds to the LLM call.
 		if len(authResponses) == 0 {
-			log.Printf("[authPreprocessor][%s] STEP 12: early exit, no auth responses to process", invID)
 			return
 		}
 
-		for i, ar := range authResponses {
-			log.Printf("[authPreprocessor][%s] STEP 13: finding original tool call for authResponse[%d] callID=%s", invID, i, ar.callID)
+		// For each processed auth callback, find the original tool call that
+		// requested credentials and re-invoke it. The tool will now succeed
+		// because GetCredential will find the stored token.
+		for _, ar := range authResponses {
 			originalCall := findOriginalToolCall(events, ar.callID)
 			if originalCall == nil {
-				log.Printf("[authPreprocessor][%s]   originalCall not found, skipping", invID)
 				continue
 			}
-			log.Printf("[authPreprocessor][%s] STEP 14: found originalCall name=%s id=%s, invoking handleFunctionCalls", invID, originalCall.Name, originalCall.ID)
 
+			// Re-run the original tool by synthesizing a FunctionCall event.
+			// handleFunctionCalls will execute the tool and yield the result.
 			ev, err := f.handleFunctionCalls(ctx, toolsmap, &model.LLMResponse{
 				Content: &genai.Content{
 					Parts: []*genai.Part{{FunctionCall: originalCall}},
 					Role:  genai.RoleUser,
 				},
 			}, nil)
-			if err != nil {
-				log.Printf("[authPreprocessor][%s] STEP 14 ERROR: handleFunctionCalls: %v", invID, err)
-			} else {
-				log.Printf("[authPreprocessor][%s] STEP 14: handleFunctionCalls succeeded", invID)
-			}
 			if !yield(ev, err) {
 				return
 			}
 		}
-		log.Printf("[authPreprocessor][%s] STEP 15: done", invID)
 	}
 }
 
-func mapKeys(m map[string]tool.Tool) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func mapKeysAny(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
+// findOriginalToolCall searches session events (newest first) for the FunctionCall that
+// matches the given ID. The ID links the auth callback to its originating tool call:
+// when a tool (e.g. get_user_info) requests credentials, the adk_request_credential
+// FunctionCall reuses the original tool's call ID, so we can trace back from the OAuth
+// callback to the tool that needs re-invocation. adk_request_credential calls themselves
+// are skipped since we need the actual tool call (get_user_info, not adk_request_credential).
 func findOriginalToolCall(events []*session.Event, functionCallID string) *genai.FunctionCall {
-	log.Printf("[findOriginalToolCall] searching for functionCallID=%s (excluding %s)", functionCallID, toolauth.FunctionCallName)
 	for k := len(events) - 1; k >= 0; k-- {
 		calls := utils.FunctionCalls(events[k].Content)
 		for _, fc := range calls {
 			if fc.ID == functionCallID && fc.Name != toolauth.FunctionCallName {
-				log.Printf("[findOriginalToolCall] found at event[%d]: name=%s id=%s", k, fc.Name, fc.ID)
 				return fc
 			}
 		}
 	}
-	log.Printf("[findOriginalToolCall] not found for functionCallID=%s", functionCallID)
 	return nil
 }
 

@@ -234,6 +234,8 @@ func taskToEvent(ctx agent.InvocationContext, task *a2a.Task) (*session.Event, e
 		longRunningToolIDs = append(longRunningToolIDs, lrtIDs...)
 	}
 
+	// TaskStateInputRequired and TaskStateAuthRequired are input-like terminal
+	// states: the agent is waiting for user input (or OAuth callback) before continuing.
 	isTerminal := task.Status.State.Terminal() || task.Status.State == a2a.TaskStateInputRequired || task.Status.State == a2a.TaskStateAuthRequired
 	if len(parts) == 0 && !isTerminal {
 		return nil, nil

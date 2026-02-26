@@ -111,6 +111,9 @@ func (c *toolContext) ToolConfirmation() *toolconfirmation.ToolConfirmation {
 	return c.toolConfirmation
 }
 
+// SessionState returns the session's state for reading. Used by CredentialHelper
+// and other tool auth flows to retrieve stored OAuth credentials (e.g. after
+// ExchangeAndStore in the adk_request_credential callback).
 func (c *toolContext) SessionState() session.ReadonlyState {
 	if c.invocationContext.Session() == nil {
 		return nil

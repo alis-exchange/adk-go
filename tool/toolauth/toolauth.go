@@ -1,6 +1,31 @@
-// Package toolauth provides structures and utilities for handling tool
-// authentication within the ADK, mirroring the Python ADK's adk_request_credential
-// protocol and supporting API_KEY, OAUTH2, HTTP Bearer, and SERVICE_ACCOUNT.
+// Package toolauth provides the adk_request_credential protocol implementation for ADK tools
+// that require user authentication (primarily OAuth2).
+//
+// # End-to-End Auth Flow
+//
+// The protocol involves coordination between three layers: the tool, the ADK runtime, and
+// the client (adk-web, a2a-playground, or any compliant frontend).
+//
+//  1. Tool requests credential: A tool calls CredentialHelper.GetCredential(). If no stored
+//     credential exists, the helper calls RequestCredential which stores the auth config in
+//     the event's StateDelta under "adk_auth_request_<functionCallID>", and the tool returns
+//     "Pending User Authorization".
+//
+//  2. Runtime detects auth request: The REST layer (RunHandler/RunSSEHandler) or A2A processor
+//     (authRequiredProcessor) detects the StateDelta key via IsAuthRequired/ExtractAuthRequest.
+//     It transforms the event into an adk_request_credential FunctionCall with the OAuth URL
+//     and sends it to the client.
+//
+//  3. Client handles OAuth: The client opens an OAuth popup, the user authenticates, and the
+//     OAuth provider redirects back with an authorization code. The client sends the callback
+//     URL back as a FunctionResponse (name="adk_request_credential") or as an authCallbackUrl.
+//
+//  4. Runtime exchanges code: authPreprocessor (for REST) or the A2A event converter (for A2A)
+//     picks up the callback, calls ExchangeAndStore to exchange the code for access/refresh
+//     tokens, and stores the tokens in session state at "temp:<credentialKey>".
+//
+//  5. Tool re-invocation: authPreprocessor finds the original tool call and re-invokes it.
+//     This time, GetCredential finds the stored token and the tool completes successfully.
 package toolauth
 
 // FunctionCallName defines the specific name for the FunctionCall/FunctionResponse event
@@ -65,11 +90,20 @@ type AuthCredential struct {
 	ServiceAccount *ServiceAccountCredential  `json:"service_account,omitempty"`
 }
 
-// AuthConfig holds the auth configuration for a credential request.
+// AuthConfig holds the full authentication configuration passed between the tool, runtime,
+// and client during the adk_request_credential flow. It carries two credential slots:
+//
+//   - RawAuthCredential: the static configuration from the tool definition (client_id,
+//     client_secret, scopes, endpoint URLs). This does not change between invocations.
+//   - ExchangedAuthCredential: populated during the flow with dynamic data. On the outbound
+//     leg (tool -> client), it contains the generated auth_uri for the OAuth popup. On the
+//     inbound leg (client -> runtime), it contains the auth_response_uri (callback URL with code).
+//
+// CredentialKey is the identifier used to store/retrieve tokens in session state.
 type AuthConfig struct {
-	RawAuthCredential       *AuthCredential `json:"raw_auth_credential,omitempty"`
-	ExchangedAuthCredential *AuthCredential `json:"exchanged_auth_credential,omitempty"`
-	CredentialKey           string         `json:"credential_key,omitempty"`
+	RawAuthCredential       *AuthCredential    `json:"raw_auth_credential,omitempty"`
+	ExchangedAuthCredential *AuthCredential    `json:"exchanged_auth_credential,omitempty"`
+	CredentialKey           string             `json:"credential_key,omitempty"`
 	AuthType                AuthCredentialType `json:"auth_type,omitempty"`
 }
 
