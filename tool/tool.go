@@ -115,16 +115,20 @@ type Context interface {
 	// and stored in session state. If tokens are available (i.e. the user has completed
 	// the OAuth flow), it returns the AuthCredential containing the access token.
 	//
-	// If no credential is found, GetAuthResponse automatically calls RequestCredential(cfg)
-	// to initiate the auth flow, and returns (nil, nil) to signal that authorization is
-	// pending. The tool should check for a nil result and return a "pending authorization"
-	// message.
+	// If no credential is found, it returns (nil, nil). This is a pure read operation --
+	// it does NOT call RequestCredential. The decision to initiate the auth flow is left
+	// to the tool developer, matching the adk-python pattern where get_auth_response and
+	// request_credential are independent methods.
 	//
 	// Typical usage:
 	//
 	//   cred, err := toolCtx.GetAuthResponse(myAuthConfig)
 	//   if err != nil { return nil, err }
-	//   if cred == nil { return "Pending authorization", nil }
+	//   if cred == nil {
+	//       // No credential yet -- explicitly request one.
+	//       if err := toolCtx.RequestCredential(myAuthConfig); err != nil { return nil, err }
+	//       return "Pending authorization", nil
+	//   }
 	//   // Use cred.OAuth2.AccessToken
 	GetAuthResponse(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error)
 }

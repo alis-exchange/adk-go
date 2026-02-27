@@ -481,33 +481,34 @@ The transport layer no longer needs to scan StateDelta and transform events. Aut
 ```
 1. Tool calls toolCtx.GetAuthResponse(cfg)
    → Checks session state for "temp:<credentialKey>"
-   → Not found: calls toolCtx.RequestCredential(cfg)
-       → Generates OAuth URL via GenerateAuthRequest
-       → Stores config in EventActions.RequestedAuthConfigs[functionCallID]
-       → Sets SkipSummarization = true
-   → Returns (nil, nil) to signal "pending"
+   → Not found: returns (nil, nil) — pure read, no side effects
 
-2. Tool returns "Pending User Authorization"
+2. Tool checks for nil and explicitly calls toolCtx.RequestCredential(cfg)
+   → Generates OAuth URL via GenerateAuthRequest
+   → Stores config in EventActions.RequestedAuthConfigs[functionCallID]
+   → Sets SkipSummarization = true
 
-3. LLM flow (base_flow.go) after handleFunctionCalls:
+3. Tool returns "Pending User Authorization"
+
+4. LLM flow (base_flow.go) after handleFunctionCalls:
    → generateAuthEvent checks ev.Actions.RequestedAuthConfigs
    → Calls BuildAuthRequestContentFromConfig for each entry
    → Yields adk_request_credential event with LongRunningToolIDs
 
-4. Transport layer (REST or A2A):
+5. Transport layer (REST or A2A):
    → REST: sends event as-is (already has correct content)
    → A2A: authRequiredProcessor detects RequestedAuthConfigs,
      emits TaskStateAuthRequired
 
-5. Client handles OAuth popup → user signs in → callback
+6. Client handles OAuth popup → user signs in → callback
 
-6. Client sends callback → authPreprocessor (unchanged):
+7. Client sends callback → authPreprocessor (unchanged):
    → Parses FunctionResponse for adk_request_credential
    → ExchangeAndStore exchanges code for tokens
    → Stores tokens at "temp:<credentialKey>"
    → Re-invokes original tool
 
-7. Tool calls toolCtx.GetAuthResponse(cfg)
+8. Tool calls toolCtx.GetAuthResponse(cfg)
    → Finds stored token → returns AuthCredential
    → Tool completes successfully
 ```
@@ -542,7 +543,7 @@ Added to the `tool.Context` interface in `tool/tool.go`:
 | Method | Signature | Purpose |
 |--------|-----------|---------|
 | `RequestCredential` | `(cfg toolauth.AuthConfig) error` | Generates the OAuth URL, stores config in `EventActions.RequestedAuthConfigs[functionCallID]`, sets `SkipSummarization = true`. Auth equivalent of `RequestConfirmation`. |
-| `GetAuthResponse` | `(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error)` | Checks session state for stored tokens. If found, returns them. If not, calls `RequestCredential` and returns `(nil, nil)` to signal "pending". Single-call convenience method. |
+| `GetAuthResponse` | `(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error)` | Pure read: checks session state for stored tokens. Returns them if found, or `(nil, nil)` if not. Does NOT call `RequestCredential` — the decision to initiate auth is left to the tool developer. Matches the `adk-python` pattern where `get_auth_response` and `request_credential` are independent methods. |
 
 **Tool usage pattern (replaces CredentialHelper):**
 
@@ -552,10 +553,14 @@ helper := agenttoolauth.NewCredentialHelper(config, oauth2.AccessTypeOffline, oa
 cred, err := helper.GetCredential(toolCtx)
 if cred == nil { helper.RequestCredential(toolCtx) }
 
-// After (tool.Context):
+// After (tool.Context — two independent calls, matching adk-python):
 cred, err := toolCtx.GetAuthResponse(myConfig)
 if err != nil { return nil, err }
-if cred == nil { return "Pending authorization", nil }
+if cred == nil {
+    // Explicitly request credential — developer controls when to initiate auth.
+    if err := toolCtx.RequestCredential(myConfig); err != nil { return nil, err }
+    return "Pending authorization", nil
+}
 // use cred.OAuth2.AccessToken
 ```
 

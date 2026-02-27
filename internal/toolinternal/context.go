@@ -181,32 +181,36 @@ func (c *toolContext) RequestCredential(cfg toolauth.AuthConfig) error {
 }
 
 // GetAuthResponse checks session state for a previously exchanged credential and returns it.
-// If no credential is found (the user hasn't completed the OAuth flow yet), it automatically
-// calls RequestCredential to initiate the flow and returns (nil, nil) to signal "pending".
+// If tokens are available (i.e. the user has completed the OAuth flow and authPreprocessor
+// has called ExchangeAndStore), it returns the AuthCredential containing the access token.
+// If no credential is found, it returns (nil, nil) without any side effects.
 //
-// The credential lookup key is CredentialStatePrefix + cfg.CredentialKey (e.g. "temp:google_user_info").
-// After ExchangeAndStore completes the token exchange, it stores the AuthCredential at this key.
+// The credential lookup key is CredentialStatePrefix + cfg.CredentialKey
+// (e.g. "temp:google_user_info"). After ExchangeAndStore completes the token exchange,
+// it stores the AuthCredential JSON at this key in session state.
 //
-// This provides a convenient single-call pattern for tools:
+// This is a pure read operation -- it does NOT call RequestCredential. The decision to
+// initiate the auth flow is left to the tool developer. This matches the adk-python pattern
+// where get_auth_response and request_credential are independent methods.
+//
+// Typical usage:
 //
 //	cred, err := toolCtx.GetAuthResponse(myConfig)
 //	if err != nil { return nil, err }
-//	if cred == nil { return "Pending authorization", nil }
-//	// use cred.OAuth2.AccessToken
+//	if cred == nil {
+//	    if err := toolCtx.RequestCredential(myConfig); err != nil { return nil, err }
+//	    return "Pending authorization", nil
+//	}
+//	// Use cred.OAuth2.AccessToken
 func (c *toolContext) GetAuthResponse(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error) {
 	state := c.SessionState()
 	if state == nil || cfg.CredentialKey == "" {
-		// No session or no credential key -- fall through to request credential.
-		if err := c.RequestCredential(cfg); err != nil {
-			return nil, err
-		}
 		return nil, nil
 	}
 
 	// Attempt to read the stored credential from session state.
 	val, err := state.Get(toolauth.CredentialStatePrefix + cfg.CredentialKey)
 	if err == nil && val != nil {
-		// Credential found -- unmarshal the JSON-encoded AuthCredential.
 		if s, ok := val.(string); ok {
 			var cred toolauth.AuthCredential
 			if json.Unmarshal([]byte(s), &cred) == nil {
@@ -215,10 +219,5 @@ func (c *toolContext) GetAuthResponse(cfg toolauth.AuthConfig) (*toolauth.AuthCr
 		}
 	}
 
-	// No stored credential found -- initiate the auth flow by requesting credential.
-	// Return (nil, nil) to signal "pending authorization" to the tool.
-	if err := c.RequestCredential(cfg); err != nil {
-		return nil, err
-	}
 	return nil, nil
 }
