@@ -23,6 +23,7 @@ import (
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/memory"
 	"google.golang.org/adk/session"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -92,6 +93,40 @@ type Context interface {
 	// Tools can use this to read credentials or other state (e.g. for OAuth).
 	// May return nil if no session is available.
 	SessionState() session.ReadonlyState
+
+	// RequestCredential initiates the OAuth credential request flow for the current tool.
+	// It stores the given AuthConfig in EventActions.RequestedAuthConfigs keyed by the
+	// tool's FunctionCallID. The LLM flow layer will detect this and yield an
+	// adk_request_credential event to the client, prompting the user to authenticate.
+	//
+	// This is the auth equivalent of RequestConfirmation for the Human-in-the-Loop flow.
+	// After calling this, the tool should return a "pending authorization" message. The
+	// ADK runtime will re-invoke the tool once the user completes the OAuth flow and
+	// tokens are exchanged.
+	//
+	// Parameters:
+	//   - cfg: The AuthConfig containing OAuth credentials (client_id, scopes, etc.)
+	//     and a CredentialKey for storing/retrieving the resulting tokens.
+	//
+	// Returns nil on success, or an error if the request could not be enqueued.
+	RequestCredential(cfg toolauth.AuthConfig) error
+
+	// GetAuthResponse checks whether a previously requested credential has been exchanged
+	// and stored in session state. If tokens are available (i.e. the user has completed
+	// the OAuth flow), it returns the AuthCredential containing the access token.
+	//
+	// If no credential is found, GetAuthResponse automatically calls RequestCredential(cfg)
+	// to initiate the auth flow, and returns (nil, nil) to signal that authorization is
+	// pending. The tool should check for a nil result and return a "pending authorization"
+	// message.
+	//
+	// Typical usage:
+	//
+	//   cred, err := toolCtx.GetAuthResponse(myAuthConfig)
+	//   if err != nil { return nil, err }
+	//   if cred == nil { return "Pending authorization", nil }
+	//   // Use cred.OAuth2.AccessToken
+	GetAuthResponse(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error)
 }
 
 // Toolset is an interface for a collection of tools. It allows grouping

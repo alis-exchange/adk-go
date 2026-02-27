@@ -453,3 +453,171 @@ These files also differ between the fork and original but the changes are unrela
 - `server/adka2a/metadata.go`, `server/adka2a/executor_test.go`, `server/adka2a/processor_test.go` — refactoring
 - `session/database/storage_session.go` — upstream changes
 - `cmd/launcher/web/webui/webui.go` — path prefix change (`/ui/` config)
+
+---
+
+## Python-Parity Refactor
+
+This section documents the second phase of changes that align the Go ADK auth handling with the Python SDK pattern. The key change is moving from StateDelta-based auth signaling to a dedicated `EventActions.RequestedAuthConfigs` field with `tool.Context.RequestCredential`/`GetAuthResponse` methods.
+
+### Architecture Change
+
+**Before (StateDelta workaround):**
+```
+Tool → CredentialHelper → StateDelta["adk_auth_request_<callID>"] = config
+  → REST/A2A transport scans StateDelta → transforms event → client
+```
+
+**After (dedicated EventActions field):**
+```
+Tool → toolCtx.RequestCredential(cfg) → EventActions.RequestedAuthConfigs[callID] = cfg
+  → generateAuthEvent in LLM flow → adk_request_credential event → transport forwards → client
+```
+
+The transport layer no longer needs to scan StateDelta and transform events. Auth events are generated in the LLM flow layer (like confirmation events), and the transport layer forwards them as-is.
+
+### End-to-End Flow (New Architecture)
+
+```
+1. Tool calls toolCtx.GetAuthResponse(cfg)
+   → Checks session state for "temp:<credentialKey>"
+   → Not found: calls toolCtx.RequestCredential(cfg)
+       → Generates OAuth URL via GenerateAuthRequest
+       → Stores config in EventActions.RequestedAuthConfigs[functionCallID]
+       → Sets SkipSummarization = true
+   → Returns (nil, nil) to signal "pending"
+
+2. Tool returns "Pending User Authorization"
+
+3. LLM flow (base_flow.go) after handleFunctionCalls:
+   → generateAuthEvent checks ev.Actions.RequestedAuthConfigs
+   → Calls BuildAuthRequestContentFromConfig for each entry
+   → Yields adk_request_credential event with LongRunningToolIDs
+
+4. Transport layer (REST or A2A):
+   → REST: sends event as-is (already has correct content)
+   → A2A: authRequiredProcessor detects RequestedAuthConfigs,
+     emits TaskStateAuthRequired
+
+5. Client handles OAuth popup → user signs in → callback
+
+6. Client sends callback → authPreprocessor (unchanged):
+   → Parses FunctionResponse for adk_request_credential
+   → ExchangeAndStore exchanges code for tokens
+   → Stores tokens at "temp:<credentialKey>"
+   → Re-invokes original tool
+
+7. Tool calls toolCtx.GetAuthResponse(cfg)
+   → Finds stored token → returns AuthCredential
+   → Tool completes successfully
+```
+
+### Import Cycle Resolution: `tool/toolauth` as Leaf Package
+
+Adding `RequestedAuthConfigs map[string]toolauth.AuthConfig` to `session.EventActions` requires `session` to import `tool/toolauth`. Previously `tool/toolauth` imported `session`, which would create a cycle.
+
+**Solution:** Make `tool/toolauth` a leaf package (same pattern as `tool/toolconfirmation`):
+
+```
+session ──imports──▶ tool/toolauth (leaf: NO session import)
+session ──imports──▶ tool/toolconfirmation (leaf: NO session import)
+tool ──imports──▶ tool/toolauth + tool/toolconfirmation + session
+```
+
+**What changed in `tool/toolauth`:**
+
+| Change | Details |
+|--------|---------|
+| Added `StateWriter` interface | `type StateWriter interface { Set(key string, value any) error }`. `session.State` implicitly satisfies this. Used by `ExchangeAndStore` and `ExchangeAndStoreServiceAccount` instead of `session.State`. |
+| Removed `IsAuthRequired(event)` | Replaced by checking `event.Actions.RequestedAuthConfigs` directly + `IsAuthRequiredInStateDelta(map)` for backward compat. |
+| Removed `ExtractAuthRequest(event)` | Replaced by iterating `event.Actions.RequestedAuthConfigs` + `ExtractAuthRequestFromState(map)` for backward compat. |
+| Removed `BuildAuthRequestEvent(event)` | Replaced by `generateAuthEvent` in LLM flow layer. |
+| Added `IsAuthRequiredInStateDelta(map)` | Same logic as old `IsAuthRequired` but takes `map[string]any` directly (no session dependency). |
+| Removed `session` import | Package now only imports `encoding/json`, `fmt`, `golang.org/x/oauth2`, `google.golang.org/genai`. |
+
+### New `tool.Context` Methods
+
+Added to the `tool.Context` interface in `tool/tool.go`:
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `RequestCredential` | `(cfg toolauth.AuthConfig) error` | Generates the OAuth URL, stores config in `EventActions.RequestedAuthConfigs[functionCallID]`, sets `SkipSummarization = true`. Auth equivalent of `RequestConfirmation`. |
+| `GetAuthResponse` | `(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error)` | Checks session state for stored tokens. If found, returns them. If not, calls `RequestCredential` and returns `(nil, nil)` to signal "pending". Single-call convenience method. |
+
+**Tool usage pattern (replaces CredentialHelper):**
+
+```go
+// Before (CredentialHelper):
+helper := agenttoolauth.NewCredentialHelper(config, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+cred, err := helper.GetCredential(toolCtx)
+if cred == nil { helper.RequestCredential(toolCtx) }
+
+// After (tool.Context):
+cred, err := toolCtx.GetAuthResponse(myConfig)
+if err != nil { return nil, err }
+if cred == nil { return "Pending authorization", nil }
+// use cred.OAuth2.AccessToken
+```
+
+### `AuthCodeOptions` on `AuthConfig`
+
+OAuth options (e.g. `oauth2.AccessTypeOffline`, `oauth2.ApprovalForce`) are now specified directly on `AuthConfig` rather than passed to a helper:
+
+```go
+var myConfig = toolauth.AuthConfig{
+    CredentialKey: "my_tool",
+    AuthCodeOptions: []oauth2.AuthCodeOption{
+        oauth2.AccessTypeOffline,
+        oauth2.ApprovalForce,
+    },
+    RawAuthCredential: &toolauth.AuthCredential{...},
+}
+```
+
+`GenerateAuthRequest` passes these to `oauth2.Config.AuthCodeURL(state, cfg.AuthCodeOptions...)`.
+
+### `generateAuthEvent` in LLM Flow
+
+New function in `internal/llminternal/functions.go` that mirrors `generateRequestConfirmationEvent`:
+
+- Checks `functionResponseEvent.Actions.RequestedAuthConfigs`
+- For each entry, calls `toolauth.BuildAuthRequestContentFromConfig(functionCallID, authConfig)`
+- Builds a `session.Event` with `LongRunningToolIDs` for client interaction
+- Wired into `base_flow.go` after `handleFunctionCalls` returns (replacing the TODO comment)
+
+`mergeEventActions` in `base_flow.go` also merges `RequestedAuthConfigs` (same pattern as `RequestedToolConfirmations`).
+
+### Updated Consumers (Dual-Path Detection)
+
+Both `server/adka2a/auth_required.go` and `server/adkrest/controllers/runtime.go` now use dual-path detection:
+
+1. **Primary:** Check `event.Actions.RequestedAuthConfigs` (new `tool.Context` path)
+2. **Fallback:** Check `event.Actions.StateDelta` via `IsAuthRequiredInStateDelta` + `ExtractAuthRequestFromState` (legacy CredentialHelper path)
+
+### Backward Compatibility
+
+| Component | Backward Compat |
+|-----------|----------------|
+| `StateDeltaKeyPrefix` | Retained with deprecation comment. Old tools still work. |
+| `ExtractAuthRequestFromState` | Still available for StateDelta parsing. |
+| `IsAuthRequiredInStateDelta` | Replaces `IsAuthRequired(event)` for StateDelta checking. |
+| `authPreprocessor` | Unchanged. Still handles OAuth callbacks from all clients. |
+| `ExchangeAndStore` | Signature changed (`session.State` → `StateWriter`), but `session.State` implicitly satisfies `StateWriter`. |
+| `BuildAuthRequestContentFromConfig` | Unchanged. Still builds `genai.Content` for A2A. |
+| `BuildAuthCallbackContent` | Unchanged. Still builds callback FunctionResponse. |
+
+### File Changes (Python-Parity Phase)
+
+| File | Change |
+|------|--------|
+| `tool/toolauth/toolauth.go` | Added `StateWriter` interface, `AuthCodeOptions` field, updated package doc. |
+| `tool/toolauth/auth_request.go` | Removed `IsAuthRequired`, `ExtractAuthRequest`, `BuildAuthRequestEvent`. Added `IsAuthRequiredInStateDelta`. Removed `session` import. |
+| `tool/toolauth/handler.go` | Changed `ExchangeAndStore`/`ExchangeAndStoreServiceAccount` to use `StateWriter`. Removed `session` import. |
+| `tool/toolauth/constants.go` | Added deprecation comment on `StateDeltaKeyPrefix`. |
+| `session/session.go` | Added `RequestedAuthConfigs map[string]toolauth.AuthConfig` to `EventActions`. Added `tool/toolauth` import. |
+| `tool/tool.go` | Added `RequestCredential(cfg)` and `GetAuthResponse(cfg)` to `Context` interface. Added `tool/toolauth` import. |
+| `internal/toolinternal/context.go` | Implemented `RequestCredential` and `GetAuthResponse` on `toolContext`. |
+| `internal/llminternal/functions.go` | Added `generateAuthEvent` function. |
+| `internal/llminternal/base_flow.go` | Wired `generateAuthEvent`, updated `mergeEventActions` for `RequestedAuthConfigs`. |
+| `server/adka2a/auth_required.go` | Updated to dual-path detection (RequestedAuthConfigs + StateDelta fallback). |
+| `server/adkrest/controllers/runtime.go` | Updated to use `IsAuthRequiredInStateDelta`/`ExtractAuthRequestFromState` (legacy fallback only). |

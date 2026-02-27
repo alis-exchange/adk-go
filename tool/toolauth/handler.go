@@ -8,8 +8,6 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-
-	"google.golang.org/adk/session"
 )
 
 // AuthConfigFromResponseMap parses a map (e.g. from a FunctionResponse.Response) into an
@@ -117,9 +115,11 @@ func camelToSnake(s string) string {
 //
 // ## Token Storage
 //
-// The resulting access/refresh tokens are stored in session state at key
-// "temp:<credentialKey>". Tools retrieve this via GetCredential on subsequent calls.
-func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) error {
+// The resulting access/refresh tokens are stored via the StateWriter interface at key
+// "temp:<credentialKey>". The state parameter accepts any type satisfying StateWriter
+// (notably session.State, which implicitly satisfies it). Tools retrieve stored tokens
+// via toolCtx.GetAuthResponse or by reading session state directly.
+func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state StateWriter) error {
 	if state == nil {
 		return fmt.Errorf("session state is nil")
 	}
@@ -247,7 +247,7 @@ func ExchangeAndStore(ctx context.Context, cfg AuthConfig, state session.State) 
 // service account JSON key from RawAuthCredential.ServiceAccount, obtains an access token
 // directly using Google's credentials API, and stores it in session state. This is useful
 // for server-to-server authentication where no user consent is needed.
-func ExchangeAndStoreServiceAccount(ctx context.Context, cfg AuthConfig, state session.State) error {
+func ExchangeAndStoreServiceAccount(ctx context.Context, cfg AuthConfig, state StateWriter) error {
 	if state == nil {
 		return fmt.Errorf("session state is nil")
 	}

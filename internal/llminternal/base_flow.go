@@ -36,6 +36,7 @@ import (
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -182,9 +183,9 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 			if !yield(modelResponseEvent, nil) {
 				return
 			}
-			// TODO: generate and yield an auth event if needed.
-
-			// Handle function calls.
+			// Handle function calls. Tools may call RequestCredential or
+			// RequestConfirmation during execution, populating the event's
+			// EventActions with RequestedAuthConfigs or RequestedToolConfirmations.
 
 			ev, err := f.handleFunctionCalls(ctx, tools, resp, nil)
 			if err != nil {
@@ -199,6 +200,17 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 			toolConfirmationEvent := generateRequestConfirmationEvent(ctx, modelResponseEvent, ev)
 			if toolConfirmationEvent != nil {
 				if !yield(toolConfirmationEvent, nil) {
+					return
+				}
+			}
+
+			// Generate and yield an auth event if any tool requested credentials.
+			// This checks ev.Actions.RequestedAuthConfigs (populated by
+			// toolCtx.RequestCredential) and builds adk_request_credential
+			// FunctionCall events with the OAuth URL for the client.
+			authEvent := generateAuthEvent(ctx, ev)
+			if authEvent != nil {
+				if !yield(authEvent, nil) {
 					return
 				}
 			}
@@ -778,6 +790,15 @@ func mergeEventActions(base, other *session.EventActions) *session.EventActions 
 			base.RequestedToolConfirmations = make(map[string]toolconfirmation.ToolConfirmation)
 		}
 		maps.Copy(base.RequestedToolConfirmations, other.RequestedToolConfirmations)
+	}
+	// Merge auth configs from parallel tool calls. When multiple tools request
+	// credentials in the same invocation, each stores its config keyed by its
+	// own functionCallID, so merging is safe (no key collisions).
+	if other.RequestedAuthConfigs != nil {
+		if base.RequestedAuthConfigs == nil {
+			base.RequestedAuthConfigs = make(map[string]toolauth.AuthConfig)
+		}
+		maps.Copy(base.RequestedAuthConfigs, other.RequestedAuthConfigs)
 	}
 	return base
 }

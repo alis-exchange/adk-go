@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"google.golang.org/adk/model"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -149,6 +150,15 @@ type EventActions struct {
 	ArtifactDelta map[string]int64
 
 	RequestedToolConfirmations map[string]toolconfirmation.ToolConfirmation
+
+	// RequestedAuthConfigs holds auth configurations requested by tools during the current
+	// invocation. When a tool calls toolCtx.RequestCredential(cfg), the config is stored
+	// here keyed by the tool's functionCallID. The LLM flow layer (generateAuthEvent)
+	// detects non-empty RequestedAuthConfigs and yields an adk_request_credential event
+	// with the OAuth URL, similar to how RequestedToolConfirmations triggers confirmation
+	// events. This replaces the legacy StateDelta-based approach where auth configs were
+	// stored under "adk_auth_request_<functionCallID>" keys.
+	RequestedAuthConfigs map[string]toolauth.AuthConfig
 
 	// If true, it won't call model to summarize function response.
 	// Only valid for function response event.

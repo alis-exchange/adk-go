@@ -1,20 +1,23 @@
 // Package toolauth provides the adk_request_credential protocol implementation for ADK tools
 // that require user authentication (primarily OAuth2).
 //
+// This is a leaf package: it does NOT import the session package, which allows session to
+// import toolauth for the EventActions.RequestedAuthConfigs field without creating an import
+// cycle. This follows the same pattern as tool/toolconfirmation.
+//
 // # End-to-End Auth Flow
 //
 // The protocol involves coordination between three layers: the tool, the ADK runtime, and
 // the client (adk-web, a2a-playground, or any compliant frontend).
 //
-//  1. Tool requests credential: A tool calls CredentialHelper.GetCredential(). If no stored
-//     credential exists, the helper calls RequestCredential which stores the auth config in
-//     the event's StateDelta under "adk_auth_request_<functionCallID>", and the tool returns
-//     "Pending User Authorization".
+//  1. Tool requests credential: A tool calls toolCtx.RequestCredential(cfg) or
+//     toolCtx.GetAuthResponse(cfg). If no stored credential exists, the config is stored
+//     in EventActions.RequestedAuthConfigs[functionCallID] and the tool returns a
+//     "Pending User Authorization" message.
 //
-//  2. Runtime detects auth request: The REST layer (RunHandler/RunSSEHandler) or A2A processor
-//     (authRequiredProcessor) detects the StateDelta key via IsAuthRequired/ExtractAuthRequest.
-//     It transforms the event into an adk_request_credential FunctionCall with the OAuth URL
-//     and sends it to the client.
+//  2. Runtime generates auth event: The LLM flow layer (generateAuthEvent in llminternal)
+//     detects RequestedAuthConfigs on the event and yields an adk_request_credential
+//     FunctionCall event with the OAuth URL and LongRunningToolIDs.
 //
 //  3. Client handles OAuth: The client opens an OAuth popup, the user authenticates, and the
 //     OAuth provider redirects back with an authorization code. The client sends the callback
@@ -25,8 +28,14 @@
 //     tokens, and stores the tokens in session state at "temp:<credentialKey>".
 //
 //  5. Tool re-invocation: authPreprocessor finds the original tool call and re-invokes it.
-//     This time, GetCredential finds the stored token and the tool completes successfully.
+//     This time, GetAuthResponse finds the stored token and the tool completes successfully.
+//
+// For backward compatibility, the StateDelta-based flow (storing auth config under
+// "adk_auth_request_<functionCallID>") is still supported as a fallback. New tools should
+// use the RequestCredential/GetAuthResponse API on tool.Context.
 package toolauth
+
+import "golang.org/x/oauth2"
 
 // FunctionCallName defines the specific name for the FunctionCall/FunctionResponse event
 // emitted when a tool requires user OAuth authorization.
@@ -101,10 +110,18 @@ type AuthCredential struct {
 //
 // CredentialKey is the identifier used to store/retrieve tokens in session state.
 type AuthConfig struct {
-	RawAuthCredential       *AuthCredential    `json:"raw_auth_credential,omitempty"`
-	ExchangedAuthCredential *AuthCredential    `json:"exchanged_auth_credential,omitempty"`
-	CredentialKey           string             `json:"credential_key,omitempty"`
-	AuthType                AuthCredentialType `json:"auth_type,omitempty"`
+	RawAuthCredential       *AuthCredential       `json:"raw_auth_credential,omitempty"`
+	ExchangedAuthCredential *AuthCredential       `json:"exchanged_auth_credential,omitempty"`
+	CredentialKey           string                `json:"credential_key,omitempty"`
+	AuthType                AuthCredentialType    `json:"auth_type,omitempty"`
+
+	// AuthCodeOptions holds additional oauth2.AuthCodeOption values passed to
+	// oauth2.Config.AuthCodeURL when generating the authorization URL. Common
+	// options include oauth2.AccessTypeOffline (to get a refresh token) and
+	// oauth2.ApprovalForce (to always show the consent screen). The json:"-"
+	// tag excludes this field from serialization since AuthCodeOption is a
+	// function type that cannot be marshaled.
+	AuthCodeOptions []oauth2.AuthCodeOption `json:"-"`
 }
 
 // APIKeyScheme defines where to send an API key (header or query).
@@ -130,6 +147,19 @@ type OpenIDConnectScheme struct {
 	AuthorizationEndpoint string            `json:"authorization_endpoint,omitempty"`
 	TokenEndpoint         string            `json:"token_endpoint,omitempty"`
 	Scopes                map[string]string `json:"scopes,omitempty"`
+}
+
+// StateWriter is a minimal interface for persisting key-value data in session state.
+// It is used by ExchangeAndStore and ExchangeAndStoreServiceAccount to store OAuth tokens
+// after a successful token exchange without importing the session package directly.
+//
+// The session.State interface implicitly satisfies StateWriter (it has a Set method with
+// the same signature), so callers can pass session.State values directly. This decoupling
+// is what makes toolauth a leaf package: it defines its own narrow interface instead of
+// depending on the full session package, which would create an import cycle since session
+// imports toolauth for EventActions.RequestedAuthConfigs.
+type StateWriter interface {
+	Set(key string, value any) error
 }
 
 // AuthToolArguments are the arguments for the adk_request_credential FunctionCall.

@@ -20,19 +20,19 @@ import (
 
 	"golang.org/x/oauth2"
 
-	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 )
 
 // GenerateAuthRequest constructs the OAuth authorization URL that the client will open in a
 // popup. It reads the client_id, redirect_uri, scopes, and endpoint URLs from the
 // RawAuthCredential in the config, then uses oauth2.Config.AuthCodeURL to build the full
-// authorization URL with state parameter. The resulting URL is stored in
-// ExchangedAuthCredential.OAuth2.AuthURI so the REST/A2A layer can include it in the
+// authorization URL with state parameter and any AuthCodeOptions (e.g. AccessTypeOffline,
+// ApprovalForce). The resulting URL is stored in ExchangedAuthCredential.OAuth2.AuthURI
+// so the LLM flow layer (generateAuthEvent) or transport layer can include it in the
 // adk_request_credential FunctionCall sent to the client.
 //
-// The returned AuthConfig is the input config augmented with ExchangedAuthCredential; the
-// caller (typically a CredentialHelper) stores this in StateDelta for downstream processing.
+// The returned AuthConfig is the input config augmented with ExchangedAuthCredential.
+// Called by toolContext.RequestCredential and BuildAuthRequestContentFromConfig.
 func GenerateAuthRequest(cfg AuthConfig) (AuthConfig, error) {
 	raw := cfg.RawAuthCredential
 	if raw == nil || raw.OAuth2 == nil {
@@ -69,7 +69,7 @@ func GenerateAuthRequest(cfg AuthConfig) (AuthConfig, error) {
 		Scopes: o2.Scopes,
 	}
 
-	authURL := config.AuthCodeURL(state)
+	authURL := config.AuthCodeURL(state, cfg.AuthCodeOptions...)
 	out := cfg
 	if out.ExchangedAuthCredential == nil {
 		out.ExchangedAuthCredential = &AuthCredential{
@@ -85,16 +85,20 @@ func GenerateAuthRequest(cfg AuthConfig) (AuthConfig, error) {
 	return out, nil
 }
 
-// IsAuthRequired returns true if the event contains a pending auth request in its StateDelta.
-// When a tool calls RequestCredential and no stored credential is found, the CredentialHelper
-// stores the auth config in StateDelta under a key prefixed with "adk_auth_request_". This
-// function checks for the presence of such keys, indicating the event should be transformed
-// into an adk_request_credential FunctionCall for the client.
-func IsAuthRequired(event *session.Event) bool {
-	if event == nil || event.Actions.StateDelta == nil {
+// IsAuthRequiredInStateDelta checks whether a StateDelta map contains a pending auth request.
+// This is the backward-compatible check for the legacy flow where tools stored auth configs
+// in StateDelta under "adk_auth_request_<functionCallID>" keys. In the new flow, consumers
+// should check EventActions.RequestedAuthConfigs first and fall back to this for compatibility.
+//
+// Parameters:
+//   - stateDelta: the map from EventActions.StateDelta (may be nil).
+//
+// Returns true if any key in stateDelta starts with StateDeltaKeyPrefix ("adk_auth_request_").
+func IsAuthRequiredInStateDelta(stateDelta map[string]any) bool {
+	if stateDelta == nil {
 		return false
 	}
-	for k := range event.Actions.StateDelta {
+	for k := range stateDelta {
 		if len(k) >= len(StateDeltaKeyPrefix) && k[:len(StateDeltaKeyPrefix)] == StateDeltaKeyPrefix {
 			return true
 		}
@@ -102,51 +106,18 @@ func IsAuthRequired(event *session.Event) bool {
 	return false
 }
 
-// ExtractAuthRequest extracts the pending auth request from an event's StateDelta. The key
-// format is "adk_auth_request_<functionCallID>" and the value is the AuthConfig (as a map,
-// pointer, or value). The functionCallID links back to the original tool FunctionCall that
-// requested credentials, enabling the preprocessor to re-invoke that tool after token exchange.
-// Returns ok=false if no auth request key is found in StateDelta.
-func ExtractAuthRequest(event *session.Event) (functionCallID string, authConfig AuthConfig, ok bool) {
-	if event == nil || event.Actions.StateDelta == nil {
-		return "", AuthConfig{}, false
-	}
-	for k, v := range event.Actions.StateDelta {
-		if len(k) <= len(StateDeltaKeyPrefix) || k[:len(StateDeltaKeyPrefix)] != StateDeltaKeyPrefix {
-			continue
-		}
-		functionCallID = k[len(StateDeltaKeyPrefix):]
-		if functionCallID == "" {
-			continue
-		}
-		var cfg AuthConfig
-		switch val := v.(type) {
-		case map[string]any:
-			data, err := json.Marshal(val)
-			if err != nil {
-				continue
-			}
-			if err := json.Unmarshal(data, &cfg); err != nil {
-				continue
-			}
-		case *AuthConfig:
-			if val != nil {
-				cfg = *val
-			}
-		case AuthConfig:
-			cfg = val
-		default:
-			continue
-		}
-		return functionCallID, cfg, true
-	}
-	return "", AuthConfig{}, false
-}
-
-// ExtractAuthRequestFromState is like ExtractAuthRequest but reads from a session state map
-// instead of an event's StateDelta. This is used by the A2A layer when processing incoming
-// messages: after events are committed, the auth config is available in session state (since
-// StateDelta gets merged into state). Returns ok=false if no auth request key is found.
+// ExtractAuthRequestFromState extracts a pending auth request from a key-value map. The map
+// can be an event's StateDelta or the full session state (since StateDelta gets merged into
+// state after commit). This is used by the A2A and REST layers for backward-compatible
+// detection of legacy StateDelta-based auth requests, and also by authPreprocessor for
+// reading stored auth configs from session state.
+//
+// The key format is "adk_auth_request_<functionCallID>" and the value is the AuthConfig
+// (as a map, pointer, or value). The functionCallID links back to the original tool
+// FunctionCall that requested credentials, enabling the preprocessor to re-invoke that
+// tool after token exchange.
+//
+// Returns ok=false if no auth request key is found.
 func ExtractAuthRequestFromState(state map[string]any) (functionCallID string, authConfig AuthConfig, ok bool) {
 	if state == nil {
 		return "", AuthConfig{}, false
@@ -263,54 +234,6 @@ func BuildAuthCallbackContent(functionCallID string, authConfig AuthConfig, call
 			},
 		},
 	}
-}
-
-// BuildAuthRequestEvent builds a session.Event representing the adk_request_credential
-// FunctionCall for the REST (adk-web) flow. Unlike BuildAuthRequestContentFromConfig (used
-// by A2A), this produces a full session.Event that replaces the original tool-response event
-// in the SSE/REST response stream.
-//
-// The event preserves the source event's ID, branch, timestamp, and invocationID so the
-// client can correlate the auth request with the original invocation. The LLMResponse.Content
-// contains the adk_request_credential FunctionCall with camelCase keys matching adk-web's
-// expected format. LongRunningToolIDs signals that this event requires user interaction
-// (the OAuth popup) before the flow can continue.
-//
-// Returns nil if GenerateAuthRequest fails (e.g. missing required fields in raw credential).
-func BuildAuthRequestEvent(sourceEvent *session.Event, functionCallID string, authConfig AuthConfig) *session.Event {
-	cfg, err := GenerateAuthRequest(authConfig)
-	if err != nil {
-		return nil
-	}
-	argsMap := map[string]any{
-		"functionCallId": functionCallID,
-		"authConfig":     toFrontendAuthConfigMap(cfg),
-	}
-	invocationID := ""
-	if sourceEvent != nil {
-		invocationID = sourceEvent.InvocationID
-	}
-	ev := session.NewEvent(invocationID)
-	ev.Author = "agent"
-	if sourceEvent != nil {
-		ev.ID = sourceEvent.ID
-		ev.Branch = sourceEvent.Branch
-		ev.Timestamp = sourceEvent.Timestamp
-	}
-	ev.LLMResponse.Content = &genai.Content{
-		Parts: []*genai.Part{
-			{
-				FunctionCall: &genai.FunctionCall{
-					Name: FunctionCallName,
-					ID:   functionCallID,
-					Args: argsMap,
-				},
-			},
-		},
-		Role: genai.RoleUser,
-	}
-	ev.LongRunningToolIDs = []string{functionCallID}
-	return ev
 }
 
 // toFrontendAuthConfigMap converts AuthConfig to a map with camelCase keys for

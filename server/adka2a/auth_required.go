@@ -27,15 +27,23 @@ import (
 // authRequiredProcessor detects tool auth requests during A2A event processing and converts
 // them into A2A-native TaskStateAuthRequired status updates.
 //
+// ## Detection Strategy (dual-path)
+//
+// The processor uses two detection paths, checked in order:
+//
+//  1. Primary: EventActions.RequestedAuthConfigs -- populated by tools that use
+//     toolCtx.RequestCredential(cfg). The LLM flow layer (generateAuthEvent) also
+//     generates an auth event from this field, but the A2A processor still checks it
+//     to produce the A2A-native TaskStateAuthRequired status update.
+//
+//  2. Fallback: EventActions.StateDelta with "adk_auth_request_" prefix -- the legacy path
+//     where tools stored auth configs via CredentialHelper. Retained for backward
+//     compatibility with existing tools.
+//
 // ## How It Fits in the A2A Flow
 //
-// When a tool calls RequestCredential and no stored token exists, the tool returns "Pending
-// User Authorization" and the CredentialHelper stores the auth config in the event's StateDelta
-// under "adk_auth_request_<functionCallID>". During event processing (in eventProcessor.process),
-// this processor checks each event for those StateDelta keys.
-//
-// If an auth request is found, the processor:
-//  1. Extracts the functionCallID and AuthConfig from StateDelta.
+// If an auth request is found (from either path), the processor:
+//  1. Extracts the functionCallID and AuthConfig.
 //  2. Calls BuildAuthRequestContentFromConfig to generate the adk_request_credential FunctionCall
 //     content with the OAuth URL.
 //  3. Converts the genai parts to A2A-native parts.
@@ -54,18 +62,40 @@ func newAuthRequiredProcessor(reqCtx *a2asrv.RequestContext) *authRequiredProces
 	return &authRequiredProcessor{reqCtx: reqCtx}
 }
 
-// process checks if the event contains an auth request in StateDelta. If found, builds
-// the adk_request_credential content and stores a TaskStateAuthRequired event. The original
-// event is returned unchanged so downstream processors (inputRequired, artifact conversion)
-// can still inspect it.
+// process checks if the event contains an auth request. It checks
+// EventActions.RequestedAuthConfigs first (new path), then falls back to
+// StateDelta scanning (legacy path). If found, builds the adk_request_credential
+// content and stores a TaskStateAuthRequired event. The original event is returned
+// unchanged so downstream processors (inputRequired, artifact conversion) can
+// still inspect it.
 func (p *authRequiredProcessor) process(event *session.Event) (*session.Event, error) {
-	if !toolauth.IsAuthRequired(event) {
-		return event, nil
+	var functionCallID string
+	var authConfig toolauth.AuthConfig
+	var found bool
+
+	// Primary path: check RequestedAuthConfigs populated by toolCtx.RequestCredential.
+	if len(event.Actions.RequestedAuthConfigs) > 0 {
+		for id, cfg := range event.Actions.RequestedAuthConfigs {
+			functionCallID = id
+			authConfig = cfg
+			found = true
+			break
+		}
 	}
-	functionCallID, authConfig, ok := toolauth.ExtractAuthRequest(event)
-	if !ok {
-		return event, nil
+
+	// Fallback path: check StateDelta for legacy "adk_auth_request_" keys.
+	if !found {
+		if !toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
+			return event, nil
+		}
+		functionCallID, authConfig, found = toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta)
+		if !found {
+			return event, nil
+		}
 	}
+
+	// Build the adk_request_credential FunctionCall content with the OAuth URL
+	// and convert to A2A-native parts for the TaskStatusUpdateEvent.
 	authContent, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(functionCallID, authConfig)
 	a2aParts, err := ToA2AParts(authContent.Parts, longRunningIDs)
 	if err != nil {

@@ -119,7 +119,7 @@ func NewLauncher() weblauncher.Sublauncher {
 
 	fs := flag.NewFlagSet("webui", flag.ContinueOnError)
 	fs.StringVar(&config.backendAddress, "api_server_address", "http://localhost:8080/api", "ADK REST API server address as seen from the user browser. Please specify the whole URL, i.e. 'http://localhost:8080/api'.")
-	config.pathPrefix = "/ui/"
+	config.pathPrefix = "/dev-ui/"
 
 	return &webUILauncher{
 		config: config,

@@ -61,14 +61,15 @@ func (c *RuntimeAPIController) RunHandler(rw http.ResponseWriter, req *http.Requ
 	}
 	var events []models.Event
 	for _, event := range sessionEvents {
-		// Transform auth-required events: when a tool stored auth config in StateDelta,
-		// replace the event's content with an adk_request_credential FunctionCall that
-		// adk-web knows how to display (OAuth popup trigger).
-		if toolauth.IsAuthRequired(event) {
-			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequest(event); ok {
-				if authEvent := toolauth.BuildAuthRequestEvent(event, fnCallID, authCfg); authEvent != nil {
-					event = authEvent
-				}
+		// Auth events from the new path (toolCtx.RequestCredential -> generateAuthEvent)
+		// arrive as separate events with LongRunningToolIDs already set. They pass through
+		// as-is. For the legacy StateDelta path (old tools), transform the event's content
+		// to include the adk_request_credential FunctionCall that adk-web expects.
+		if toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
+			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta); ok {
+				content, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(fnCallID, authCfg)
+				event.LLMResponse.Content = content
+				event.LongRunningToolIDs = longRunningIDs
 			}
 		}
 		events = append(events, models.FromSessionEvent(*event))
@@ -160,13 +161,14 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 
 			continue
 		}
-		// Transform auth-required events (StateDelta with adk_auth_request_*)
-		// into adk_request_credential format for adk-web compatibility.
-		if toolauth.IsAuthRequired(event) {
-			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequest(event); ok {
-				if authEvent := toolauth.BuildAuthRequestEvent(event, fnCallID, authCfg); authEvent != nil {
-					event = authEvent
-				}
+		// Auth events from the new path (toolCtx.RequestCredential -> generateAuthEvent)
+		// arrive as separate events with LongRunningToolIDs already set and pass through.
+		// For the legacy StateDelta path, transform the event content inline.
+		if toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
+			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta); ok {
+				content, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(fnCallID, authCfg)
+				event.LLMResponse.Content = content
+				event.LongRunningToolIDs = longRunningIDs
 			}
 		}
 		err := flashEvent(rc, rw, *event)

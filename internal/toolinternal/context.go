@@ -16,6 +16,7 @@ package toolinternal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/adk/memory"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -140,4 +142,83 @@ func (c *toolContext) RequestConfirmation(hint string, payload any) error {
 	// functiontool (function.go).
 	c.eventActions.SkipSummarization = true
 	return nil
+}
+
+// RequestCredential stores an OAuth auth config in EventActions.RequestedAuthConfigs so the
+// LLM flow layer (generateAuthEvent) will yield an adk_request_credential event to the
+// client. This is the auth equivalent of RequestConfirmation: it signals that the tool
+// needs user authorization before it can proceed.
+//
+// The config is first passed through GenerateAuthRequest to build the OAuth authorization
+// URL (populating ExchangedAuthCredential.OAuth2.AuthURI). The resulting config is stored
+// keyed by the tool's functionCallID so the preprocessor can correlate the callback.
+//
+// SkipSummarization is set to true to stop the agent loop after this tool call, matching
+// the behavior of RequestConfirmation. Without it, the function response would trigger
+// another LLM round.
+func (c *toolContext) RequestCredential(cfg toolauth.AuthConfig) error {
+	if c.functionCallID == "" {
+		return fmt.Errorf("RequestCredential requires function_call_id")
+	}
+	if c.eventActions.RequestedAuthConfigs == nil {
+		c.eventActions.RequestedAuthConfigs = make(map[string]toolauth.AuthConfig)
+	}
+
+	// Generate the OAuth authorization URL from the raw credential config.
+	// This populates ExchangedAuthCredential.OAuth2.AuthURI which the client
+	// uses to open the OAuth popup.
+	generated, err := toolauth.GenerateAuthRequest(cfg)
+	if err != nil {
+		return fmt.Errorf("generate auth request: %w", err)
+	}
+
+	c.eventActions.RequestedAuthConfigs[c.functionCallID] = generated
+
+	// Stop the agent loop after this tool call so the auth event can be sent
+	// to the client. Same rationale as RequestConfirmation.
+	c.eventActions.SkipSummarization = true
+	return nil
+}
+
+// GetAuthResponse checks session state for a previously exchanged credential and returns it.
+// If no credential is found (the user hasn't completed the OAuth flow yet), it automatically
+// calls RequestCredential to initiate the flow and returns (nil, nil) to signal "pending".
+//
+// The credential lookup key is CredentialStatePrefix + cfg.CredentialKey (e.g. "temp:google_user_info").
+// After ExchangeAndStore completes the token exchange, it stores the AuthCredential at this key.
+//
+// This provides a convenient single-call pattern for tools:
+//
+//	cred, err := toolCtx.GetAuthResponse(myConfig)
+//	if err != nil { return nil, err }
+//	if cred == nil { return "Pending authorization", nil }
+//	// use cred.OAuth2.AccessToken
+func (c *toolContext) GetAuthResponse(cfg toolauth.AuthConfig) (*toolauth.AuthCredential, error) {
+	state := c.SessionState()
+	if state == nil || cfg.CredentialKey == "" {
+		// No session or no credential key -- fall through to request credential.
+		if err := c.RequestCredential(cfg); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	// Attempt to read the stored credential from session state.
+	val, err := state.Get(toolauth.CredentialStatePrefix + cfg.CredentialKey)
+	if err == nil && val != nil {
+		// Credential found -- unmarshal the JSON-encoded AuthCredential.
+		if s, ok := val.(string); ok {
+			var cred toolauth.AuthCredential
+			if json.Unmarshal([]byte(s), &cred) == nil {
+				return &cred, nil
+			}
+		}
+	}
+
+	// No stored credential found -- initiate the auth flow by requesting credential.
+	// Return (nil, nil) to signal "pending authorization" to the tool.
+	if err := c.RequestCredential(cfg); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
