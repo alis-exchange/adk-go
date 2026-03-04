@@ -97,9 +97,19 @@ func (m *geminiModel) addHeaders(headers http.Header) {
 	headers.Set("user-agent", m.versionHeaderValue)
 }
 
+// modelName returns the model name to use for the API call.
+// It prefers req.Model (which can be set by BeforeModelCallback),
+// falling back to the construction-time name if unset.
+func (m *geminiModel) modelName(req *model.LLMRequest) string {
+	if req.Model != "" {
+		return req.Model
+	}
+	return m.name
+}
+
 // generate calls the model synchronously returning result from the first candidate.
 func (m *geminiModel) generate(ctx context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
-	resp, err := m.client.Models.GenerateContent(ctx, m.name, req.Contents, req.Config)
+	resp, err := m.client.Models.GenerateContent(ctx, m.modelName(req), req.Contents, req.Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call model: %w", err)
 	}
@@ -115,7 +125,7 @@ func (m *geminiModel) generateStream(ctx context.Context, req *model.LLMRequest)
 	aggregator := llminternal.NewStreamingResponseAggregator()
 
 	return func(yield func(*model.LLMResponse, error) bool) {
-		for resp, err := range m.client.Models.GenerateContentStream(ctx, m.name, req.Contents, req.Config) {
+		for resp, err := range m.client.Models.GenerateContentStream(ctx, m.modelName(req), req.Contents, req.Config) {
 			if err != nil {
 				yield(nil, err)
 				return

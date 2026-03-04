@@ -189,6 +189,62 @@ func TestModel_TrackingHeaders(t *testing.T) {
 	})
 }
 
+func TestModel_RespectsRequestModel(t *testing.T) {
+	tests := []struct {
+		name            string
+		constructorName string
+		reqModel        string
+		wantInURL       string
+	}{
+		{
+			name:            "uses_constructor_name_when_req_model_empty",
+			constructorName: "gemini-2.5-flash",
+			reqModel:        "",
+			wantInURL:       "gemini-2.5-flash",
+		},
+		{
+			name:            "uses_req_model_when_set",
+			constructorName: "gemini-2.5-flash",
+			reqModel:        "gemini-2.0-flash",
+			wantInURL:       "gemini-2.0-flash",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedURL string
+			interceptor := &headerInterceptor{
+				check: func(req *http.Request) {
+					capturedURL = req.URL.Path
+				},
+			}
+
+			cfg := &genai.ClientConfig{
+				HTTPClient: &http.Client{Transport: interceptor},
+				APIKey:     "fakekey",
+			}
+
+			geminiModel, err := NewModel(t.Context(), tt.constructorName, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := &model.LLMRequest{
+				Model:    tt.reqModel,
+				Contents: genai.Text("ping"),
+			}
+			for range geminiModel.GenerateContent(t.Context(), req, false) {
+			}
+
+			if capturedURL == "" {
+				t.Fatal("HTTP request was not intercepted")
+			}
+			if !strings.Contains(capturedURL, tt.wantInURL) {
+				t.Errorf("URL path = %q, want it to contain %q", capturedURL, tt.wantInURL)
+			}
+		})
+	}
+}
+
 // TextResponse holds the concatenated text from a response stream,
 // separated into partial and final parts.
 type TextResponse struct {
