@@ -60,6 +60,7 @@ func TestModel_Generate(t *testing.T) {
 					ThoughtsTokenCount:      34,
 					TotalTokenCount:         46,
 				},
+				ModelVersion: "gemini-2.0-flash",
 				FinishReason: "STOP",
 			},
 		},
