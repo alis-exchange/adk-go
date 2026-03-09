@@ -47,7 +47,7 @@ func okFunc(_ tool.Context, _ SimpleArgs) (string, error) {
 
 func TestBeforeModelCallback(t *testing.T) {
 	invCtx := icontext.NewInvocationContext(t.Context(), icontext.InvocationContextParams{})
-	ctx := icontext.NewCallbackContextWithDelta(invCtx, nil)
+	ctx := icontext.NewCallbackContextWithDelta(invCtx, nil, nil)
 
 	transferTool := &llminternal.TransferToAgentTool{}
 	transferToolDecl := transferTool.Declaration()
@@ -266,7 +266,7 @@ func TestAfterModelCallback(t *testing.T) {
 			invCtx := icontext.NewInvocationContext(t.Context(), icontext.InvocationContextParams{
 				Session: sesResp.Session,
 			})
-			ctx := icontext.NewCallbackContextWithDelta(invCtx, nil)
+			ctx := icontext.NewCallbackContextWithDelta(invCtx, nil, nil)
 
 			afterModelCallback := plugin.AfterModelCallback()
 			if _, err := afterModelCallback(ctx, &model.LLMResponse{Content: tc.content}, nil); err != nil {
