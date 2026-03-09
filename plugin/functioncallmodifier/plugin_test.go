@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 
@@ -392,8 +393,7 @@ func cloneLLMRequest(t *testing.T, req *model.LLMRequest) *model.LLMRequest {
 			newReq.Config.Tools = append(newReq.Config.Tools, newTool)
 		}
 	}
-	for k, v := range req.Tools {
-		newReq.Tools[k] = v // Shallow copy of tool instances
-	}
+	// Shallow copy of tool instances
+	maps.Copy(newReq.Tools, req.Tools)
 	return newReq
 }
