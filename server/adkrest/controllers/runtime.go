@@ -24,10 +24,11 @@ import (
 	"net/http"
 	"time"
 
+	"google.golang.org/genai"
+
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/artifact"
 	"google.golang.org/adk/memory"
-	"google.golang.org/genai"
 	"google.golang.org/adk/runner"
 	"google.golang.org/adk/server/adkrest/internal/models"
 	"google.golang.org/adk/session"
@@ -61,17 +62,7 @@ func (c *RuntimeAPIController) RunHandler(rw http.ResponseWriter, req *http.Requ
 	}
 	var events []models.Event
 	for _, event := range sessionEvents {
-		// Auth events from the new path (toolCtx.RequestCredential -> generateAuthEvent)
-		// arrive as separate events with LongRunningToolIDs already set. They pass through
-		// as-is. For the legacy StateDelta path (old tools), transform the event's content
-		// to include the adk_request_credential FunctionCall that adk-web expects.
-		if toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
-			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta); ok {
-				content, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(fnCallID, authCfg)
-				event.LLMResponse.Content = content
-				event.LongRunningToolIDs = longRunningIDs
-			}
-		}
+		transformLegacyAuthEvent(event)
 		events = append(events, models.FromSessionEvent(*event))
 	}
 	EncodeJSONResponse(events, http.StatusOK, rw)
@@ -97,7 +88,8 @@ func (c *RuntimeAPIController) runAgent(ctx context.Context, runAgentRequest mod
 		return nil, err
 	}
 
-	resp := r.Run(ctx, runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg)
+	opts := runOptions(runAgentRequest)
+	resp := r.Run(ctx, runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg, opts...)
 
 	var events []*session.Event
 	for event, err := range resp {
@@ -145,7 +137,8 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 		return err
 	}
 
-	resp := r.Run(req.Context(), runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg)
+	opts := runOptions(runAgentRequest)
+	resp := r.Run(req.Context(), runAgentRequest.UserId, runAgentRequest.SessionId, msg, *rCfg, opts...)
 
 	for event, err := range resp {
 		if err != nil {
@@ -160,22 +153,20 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 
 			continue
 		}
-		// Auth events from the new path (toolCtx.RequestCredential -> generateAuthEvent)
-		// arrive as separate events with LongRunningToolIDs already set and pass through.
-		// For the legacy StateDelta path, transform the event content inline.
-		if toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
-			if fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta); ok {
-				content, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(fnCallID, authCfg)
-				event.LLMResponse.Content = content
-				event.LongRunningToolIDs = longRunningIDs
-			}
-		}
+		transformLegacyAuthEvent(event)
 		err := flashEvent(rc, rw, *event)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func runOptions(req models.RunAgentRequest) []runner.RunOption {
+	if req.StateDelta == nil {
+		return nil
+	}
+	return []runner.RunOption{runner.WithStateDelta(*req.StateDelta)}
 }
 
 func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event session.Event) error {
@@ -198,21 +189,16 @@ func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event sessi
 	return nil
 }
 
-// transformAuthCallback converts an OAuth callback URL into a genai.Content message that
-// authPreprocessor can process. This bridges the gap between the adk-web client (which sends
-// the callback URL as a simple authCallbackUrl field) and the internal auth protocol (which
-// expects an adk_request_credential FunctionResponse).
-//
-// The flow:
-//  1. adk-web completes OAuth and reloads with ?authCallbackUrl=<url with code>.
-//  2. decodeRequestBody reads authCallbackUrl from the query param or request body.
-//  3. This function fetches the session to find the pending auth request (stored in state
-//     by the previous invocation's StateDelta).
-//  4. Builds a FunctionResponse with the auth config + callback URL.
-//  5. The runner processes this message through authPreprocessor which exchanges the code
-//     for tokens and re-invokes the original tool.
-//
-// Returns nil if no pending auth request exists in session state (normal request path).
+func transformLegacyAuthEvent(event *session.Event) {
+	if toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
+		if fnCallID, authCfg, ok := toolauth.ExtractAuthRequestFromState(event.Actions.StateDelta); ok {
+			content, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(fnCallID, authCfg)
+			event.LLMResponse.Content = content
+			event.LongRunningToolIDs = longRunningIDs
+		}
+	}
+}
+
 func (c *RuntimeAPIController) transformAuthCallback(ctx context.Context, req models.RunAgentRequest) *genai.Content {
 	resp, err := c.sessionService.Get(ctx, &session.GetRequest{
 		AppName:   req.AppName,

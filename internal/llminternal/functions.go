@@ -15,6 +15,8 @@
 package llminternal
 
 import (
+	"time"
+
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
