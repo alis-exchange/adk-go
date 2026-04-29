@@ -17,8 +17,8 @@ package adka2a
 import (
 	"fmt"
 
-	"github.com/a2aproject/a2a-go/a2a"
-	"github.com/a2aproject/a2a-go/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool/toolauth"
@@ -39,26 +39,12 @@ import (
 //  2. Fallback: EventActions.StateDelta with "adk_auth_request_" prefix -- the legacy path
 //     where tools stored auth configs via CredentialHelper. Retained for backward
 //     compatibility with existing tools.
-//
-// ## How It Fits in the A2A Flow
-//
-// If an auth request is found (from either path), the processor:
-//  1. Extracts the functionCallID and AuthConfig.
-//  2. Calls BuildAuthRequestContentFromConfig to generate the adk_request_credential FunctionCall
-//     content with the OAuth URL.
-//  3. Converts the genai parts to A2A-native parts.
-//  4. Wraps them in a TaskStatusUpdateEvent with state=auth-required and final=true.
-//
-// The stored event (p.event) is later used by makeFinalStatusUpdate as the terminal status
-// for the A2A task. The A2A client receives this, opens the OAuth popup, and upon completion
-// sends the callback via sendStreamingMessage which flows through the A2A event conversion
-// layer and eventually reaches authPreprocessor for token exchange.
 type authRequiredProcessor struct {
-	reqCtx *a2asrv.RequestContext
+	reqCtx *a2asrv.ExecutorContext
 	event  *a2a.TaskStatusUpdateEvent
 }
 
-func newAuthRequiredProcessor(reqCtx *a2asrv.RequestContext) *authRequiredProcessor {
+func newAuthRequiredProcessor(reqCtx *a2asrv.ExecutorContext) *authRequiredProcessor {
 	return &authRequiredProcessor{reqCtx: reqCtx}
 }
 
@@ -73,7 +59,6 @@ func (p *authRequiredProcessor) process(event *session.Event) (*session.Event, e
 	var authConfig toolauth.AuthConfig
 	var found bool
 
-	// Primary path: check RequestedAuthConfigs populated by toolCtx.RequestCredential.
 	if len(event.Actions.RequestedAuthConfigs) > 0 {
 		for id, cfg := range event.Actions.RequestedAuthConfigs {
 			functionCallID = id
@@ -83,7 +68,6 @@ func (p *authRequiredProcessor) process(event *session.Event) (*session.Event, e
 		}
 	}
 
-	// Fallback path: check StateDelta for legacy "adk_auth_request_" keys.
 	if !found {
 		if !toolauth.IsAuthRequiredInStateDelta(event.Actions.StateDelta) {
 			return event, nil
@@ -94,8 +78,6 @@ func (p *authRequiredProcessor) process(event *session.Event) (*session.Event, e
 		}
 	}
 
-	// Build the adk_request_credential FunctionCall content with the OAuth URL
-	// and convert to A2A-native parts for the TaskStatusUpdateEvent.
 	authContent, longRunningIDs := toolauth.BuildAuthRequestContentFromConfig(functionCallID, authConfig)
 	a2aParts, err := ToA2AParts(authContent.Parts, longRunningIDs)
 	if err != nil {
@@ -103,7 +85,6 @@ func (p *authRequiredProcessor) process(event *session.Event) (*session.Event, e
 	}
 	msg := a2a.NewMessage(a2a.MessageRoleAgent, a2aParts...)
 	ev := a2a.NewStatusUpdateEvent(p.reqCtx, a2a.TaskStateAuthRequired, msg)
-	ev.Final = true
 	p.event = ev
 	return event, nil
 }
