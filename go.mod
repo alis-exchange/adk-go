@@ -36,7 +36,12 @@ require (
 	rsc.io/ordered v1.1.1
 )
 
-require github.com/hashicorp/golang-lru/v2 v2.0.7
+require (
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260504200637-e182dbfab154
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+)
+
+require github.com/sirupsen/logrus v1.9.3 // indirect
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.2.1
