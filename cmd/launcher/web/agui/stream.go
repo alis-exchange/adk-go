@@ -51,14 +51,14 @@ type interrupt struct {
 // not yet have an Outcome field, so we define a local event type that includes it.
 type runFinishedInterruptEvent struct {
 	*events.BaseEvent
-	ThreadIDValue string           `json:"threadId"`
-	RunIDValue    string           `json:"runId"`
+	ThreadIDValue string            `json:"threadId"`
+	RunIDValue    string            `json:"runId"`
 	Outcome       *interruptOutcome `json:"outcome,omitempty"`
 }
 
-func (e *runFinishedInterruptEvent) ThreadID() string         { return e.ThreadIDValue }
-func (e *runFinishedInterruptEvent) RunID() string            { return e.RunIDValue }
-func (e *runFinishedInterruptEvent) ToJSON() ([]byte, error)  { return json.Marshal(e) }
+func (e *runFinishedInterruptEvent) ThreadID() string        { return e.ThreadIDValue }
+func (e *runFinishedInterruptEvent) RunID() string           { return e.RunIDValue }
+func (e *runFinishedInterruptEvent) ToJSON() ([]byte, error) { return json.Marshal(e) }
 
 func (e *runFinishedInterruptEvent) Validate() error {
 	if err := e.BaseEvent.Validate(); err != nil {

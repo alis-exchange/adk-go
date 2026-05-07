@@ -64,11 +64,11 @@ type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part 
 
 // AGUIConfig holds configuration for the AG-UI sublauncher.
 type AGUIConfig struct {
-	appName           string
-	pathPrefix        string
-	interceptors      []CallInterceptor
-	cors              *CORSConfig
-	capabilities      *Capabilities
+	appName            string
+	pathPrefix         string
+	interceptors       []CallInterceptor
+	cors               *CORSConfig
+	capabilities       *Capabilities
 	genAIPartConverter GenAIPartConverter
 }
 
