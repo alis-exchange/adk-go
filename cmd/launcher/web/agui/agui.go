@@ -1,3 +1,6 @@
+// Package agui implements an AG-UI protocol sublauncher for ADK agents.
+// It bridges ADK agent execution to the AG-UI SSE protocol, enabling
+// CopilotKit and other AG-UI-compatible frontends to stream agent responses.
 package agui
 
 import (
@@ -17,6 +20,7 @@ import (
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/cmd/launcher"
 	weblauncher "google.golang.org/adk/cmd/launcher/web"
+	"google.golang.org/adk/internal/cli/util"
 	"google.golang.org/adk/runner"
 	"google.golang.org/genai"
 )
@@ -85,6 +89,7 @@ func WithCapabilities(caps Capabilities) Option {
 type aguiLauncher struct {
 	flags  *flag.FlagSet
 	config *AGUIConfig
+	runner *runner.Runner
 }
 
 // NewLauncher creates a new AG-UI sublauncher that serves the /run_sse endpoint
@@ -128,11 +133,7 @@ func (l *aguiLauncher) Parse(args []string) ([]string, error) {
 
 // CommandLineSyntax returns a formatted string describing all available flags.
 func (l *aguiLauncher) CommandLineSyntax() string {
-	var buf strings.Builder
-	l.flags.VisitAll(func(f *flag.Flag) {
-		fmt.Fprintf(&buf, "  -%s\t%s (default: %s)\n", f.Name, f.Usage, f.DefValue)
-	})
-	return buf.String()
+	return util.FormatFlagUsage(l.flags)
 }
 
 // SimpleDescription returns a human-readable description of the sublauncher.
@@ -146,7 +147,21 @@ func (l *aguiLauncher) SimpleDescription() string {
 //
 // When CORS is configured, OPTIONS preflight is also handled for both routes.
 func (l *aguiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
-	h := l.runSSEHandler(config)
+	agentRunner, err := runner.New(runner.Config{
+		AppName:           l.config.appName,
+		Agent:             config.AgentLoader.RootAgent(),
+		SessionService:    config.SessionService,
+		ArtifactService:   config.ArtifactService,
+		MemoryService:     config.MemoryService,
+		PluginConfig:      config.PluginConfig,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create agent runner: %w", err)
+	}
+	l.runner = agentRunner
+
+	h := l.runSSEHandler()
 
 	if l.config.cors != nil {
 		h = l.corsMiddleware(h)
@@ -297,11 +312,11 @@ func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
 // runSSEHandler returns the HTTP handler for the AG-UI /run_sse endpoint.
 //
 // The handler has two phases separated by the SSE commitment point:
-//   - Pre-SSE: request parsing, interceptors, validation, agent loading.
+//   - Pre-SSE: request parsing, interceptors, validation.
 //     Errors in this phase return standard HTTP error responses.
 //   - Post-SSE: after SSE headers are written and RunStartedEvent is emitted.
 //     Errors in this phase are delivered as RunErrorEvent on the SSE stream.
-func (l *aguiLauncher) runSSEHandler(config *launcher.Config) http.Handler {
+func (l *aguiLauncher) runSSEHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// --- Pre-SSE phase: errors use http.Error ---
 
@@ -363,28 +378,6 @@ func (l *aguiLauncher) runSSEHandler(config *launcher.Config) http.Handler {
 			return
 		}
 		userID := callCtx.User.Name
-
-		currentAgent, err := config.AgentLoader.LoadAgent(l.config.appName)
-		if err != nil {
-			handlerErr = err
-			http.Error(w, "Failed to load agent: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		agentRunner, err := runner.New(runner.Config{
-			AppName:           l.config.appName,
-			Agent:             currentAgent,
-			SessionService:    config.SessionService,
-			ArtifactService:   config.ArtifactService,
-			MemoryService:     config.MemoryService,
-			PluginConfig:      config.PluginConfig,
-			AutoCreateSession: true,
-		})
-		if err != nil {
-			handlerErr = err
-			http.Error(w, "Failed to create agent runner: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
 
 		// Extract the last user message from the AG-UI request.
 		// AG-UI sends the full conversation history; we only need the latest user turn
@@ -512,7 +505,7 @@ func (l *aguiLauncher) runSSEHandler(config *launcher.Config) http.Handler {
 			runOpts = append(runOpts, runner.WithStateDelta(stateMap))
 		}
 
-		for ev, err := range agentRunner.Run(ctx, userID, sessionID, msg, cfg, runOpts...) {
+		for ev, err := range l.runner.Run(ctx, userID, sessionID, msg, cfg, runOpts...) {
 			if err != nil {
 				emitError(err.Error())
 				handlerErr = err
