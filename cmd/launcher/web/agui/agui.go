@@ -147,6 +147,18 @@ func (l *aguiLauncher) SimpleDescription() string {
 //
 // When CORS is configured, OPTIONS preflight is also handled for both routes.
 func (l *aguiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
+	// TODO: Support multi-tenant / multi-agent routing.
+	// The runner is currently created once at setup for the single root agent,
+	// which means one aguiLauncher instance serves exactly one agent. To support
+	// multi-agent routing (e.g. /agui/{app_name}/run_sse), this would need to:
+	//   1. Register path-based routes with an {app_name} variable.
+	//   2. Extract app_name from the request in runSSEHandler.
+	//   3. Call config.AgentLoader.LoadAgent(appName) per request to resolve
+	//      the target agent dynamically.
+	//   4. Create the runner per request (as the REST API controller does in
+	//      server/adkrest/controllers/runtime.go RuntimeAPIController.getRunner).
+	// Until then, deploy one aguiLauncher per agent, matching the A2A launcher
+	// pattern which also binds to a single RootAgent at setup time.
 	agentRunner, err := runner.New(runner.Config{
 		AppName:           l.config.appName,
 		Agent:             config.AgentLoader.RootAgent(),
@@ -462,6 +474,13 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+
+		rc := http.NewResponseController(w)
+		if err := rc.Flush(); err != nil {
+			handlerErr = fmt.Errorf("failed to flush SSE headers: %w", err)
+			http.Error(w, handlerErr.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		e := newEmitter(ctx, w, sse.NewSSEWriter())
 
