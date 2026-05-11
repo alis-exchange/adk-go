@@ -363,7 +363,7 @@ func convertMultimodalInput(ic types.InputContent) (*genai.Part, error) {
 //     Errors in this phase are delivered as RunErrorEvent on the SSE stream.
 func (l *aguiLauncher) runSSEHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// --- Pre-SSE phase: errors use http.Error ---
+		// Pre-SSE phase: errors use http.Error.
 
 		var req types.RunAgentInput
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -502,7 +502,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			return
 		}
 
-		// --- SSE commitment point: after this, errors become RunErrorEvent ---
+		// SSE commitment point: after this, errors become RunErrorEvent.
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -578,35 +578,39 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 				break
 			}
 
-			if err := l.processEvent(e, ev, state); err != nil {
+			done, err := l.processEvent(e, ev, state)
+			if err != nil {
 				emitError(err.Error())
 				handlerErr = err
 				break
 			}
+			if done {
+				break
+			}
 		}
 
-		// TODO: Implement AG-UI interrupt protocol for human-in-the-loop flows.
-		// The AG-UI spec (docs.ag-ui.com/concepts/interrupts) defines an interrupt-
-		// aware run lifecycle where the run ends with:
-		//   RunFinished { outcome: { type: "interrupt", interrupts: [...] } }
-		// and the client resumes by sending a new RunAgentInput with a `resume`
-		// array. This is architecturally different from ADK's model:
-		//   - ADK: the run stays open; the runner blocks on adk_request_confirmation
-		//     FunctionCalls and waits for a FunctionResponse on the same session.
-		//   - AG-UI: the run terminates, the SSE connection closes, and a new run
-		//     carries the user's decision in `resume[].payload`.
-		// Bridging these requires:
-		//   1. The AG-UI Go SDK to add `Outcome` to RunFinishedEvent and `Resume`
-		//      to RunAgentInput (not yet implemented in the community Go SDK).
-		//   2. Detecting when ADK emits an adk_request_confirmation FunctionCall,
-		//      converting it to an AG-UI Interrupt, emitting RunFinished with the
-		//      interrupt outcome, and closing the SSE stream.
-		//   3. On the resumed run, extracting `req.Resume`, converting the user's
-		//      decision to an ADK FunctionResponse, and injecting it into the
-		//      session before restarting the runner.
-		// Until then, ADK's native HITL works within a single run: the
-		// adk_request_confirmation FunctionCall is emitted as standard ToolCall
-		// events, and the frontend can inspect the tool name to show approval UI.
+		// TODO: Implement AG-UI interrupt resume protocol.
+		// The emit half is done: adk_request_confirmation FunctionCalls are
+		// detected and converted to RunFinished { outcome: { type: "interrupt" } }
+		// with the original tool call emitted as ToolCallStart/Args/End for
+		// the audit trail. The resume half requires:
+		//   1. The AG-UI Go SDK to add a `Resume` field to RunAgentInput
+		//      ([]ResumeEntry with interruptId, status, and payload).
+		//   2. On a resumed run, extract req.Resume entries and for each:
+		//      a. Look up the ADK confirmation call ID from the interrupt's
+		//         metadata["adk"]["confirmationCallId"].
+		//      b. Build a genai.FunctionResponse with:
+		//           Name: toolconfirmation.FunctionCallName
+		//           ID:   confirmationCallId
+		//           Response: map[string]any{
+		//             "confirmed": payload["approved"],
+		//             "payload":   payload (or payload["editedArgs"]),
+		//           }
+		//      c. Inject the FunctionResponse into the ADK session as a user
+		//         content event and restart the runner.
+		//   3. Cancelled resumes (status: "cancelled") should map to
+		//      confirmed=false with no payload.
+		// See: https://docs.ag-ui.com/concepts/interrupts
 
 		// Emit RunFinishedEvent only if no terminal event (RunError) was already sent.
 		if !state.runFinalized {
