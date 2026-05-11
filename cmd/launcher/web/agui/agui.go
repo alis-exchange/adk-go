@@ -4,6 +4,7 @@
 package agui
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	weblauncher "google.golang.org/adk/cmd/launcher/web"
 	"google.golang.org/adk/internal/cli/util"
 	"google.golang.org/adk/runner"
+	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 )
 
@@ -47,13 +49,27 @@ type CORSConfig struct {
 	AllowCredentials bool
 }
 
+// GenAIPartConverter converts a genai.Part from an ADK session event into
+// zero or more AG-UI events, allowing consumers to intercept, transform, or
+// suppress specific parts before the default event mapping runs.
+//
+// Return a non-nil slice (including empty) to indicate the part was handled;
+// the default processing is skipped and the returned events are emitted.
+// Return (nil, nil) to fall through to the default handler for that part.
+//
+// This mirrors the adka2a.GenAIPartConverter pattern: nil returns mean
+// "not handled, use default", while non-nil returns (even an empty slice)
+// mean "handled, skip default".
+type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part *genai.Part) ([]events.Event, error)
+
 // AGUIConfig holds configuration for the AG-UI sublauncher.
 type AGUIConfig struct {
-	appName      string
-	pathPrefix   string
-	interceptors []CallInterceptor
-	cors         *CORSConfig
-	capabilities *Capabilities
+	appName           string
+	pathPrefix        string
+	interceptors      []CallInterceptor
+	cors              *CORSConfig
+	capabilities      *Capabilities
+	genAIPartConverter GenAIPartConverter
 }
 
 // Option configures an AGUIConfig.
@@ -82,6 +98,23 @@ func WithCORS(cors CORSConfig) Option {
 func WithCapabilities(caps Capabilities) Option {
 	return func(c *AGUIConfig) {
 		c.capabilities = &caps
+	}
+}
+
+// WithGenAIPartConverter registers a callback that intercepts genai.Part values
+// from ADK session events before the default AG-UI event mapping runs.
+//
+// When the converter returns a non-nil slice, those events are emitted and the
+// default handling for that part is skipped. When it returns (nil, nil), the
+// default mapping (text streaming, tool calls, etc.) proceeds normally.
+//
+// This is the AG-UI equivalent of [adka2a.ExecutorConfig.GenAIPartConverter]:
+// it lets consumers customize how specific parts (e.g. generative UI payloads,
+// extension-specific function calls) are represented on the SSE stream without
+// modifying the launcher itself.
+func WithGenAIPartConverter(converter GenAIPartConverter) Option {
+	return func(c *AGUIConfig) {
+		c.genAIPartConverter = converter
 	}
 }
 
@@ -529,6 +562,9 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 				emitError(err.Error())
 				handlerErr = err
 				break
+			}
+			if ev == nil {
+				continue
 			}
 
 			if ev.ErrorMessage != "" {

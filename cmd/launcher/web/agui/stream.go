@@ -84,6 +84,24 @@ func (l *aguiLauncher) processEvent(e *emitter, ev *session.Event, state *stream
 			if e.err != nil {
 				return e.err
 			}
+			if part == nil {
+				continue
+			}
+
+			// Let the consumer's part converter handle the part first.
+			// A non-nil return (even empty) means "handled, skip default".
+			if l.config.genAIPartConverter != nil {
+				customEvents, err := l.config.genAIPartConverter(e.ctx, ev, part)
+				if err != nil {
+					return fmt.Errorf("GenAIPartConverter: %w", err)
+				}
+				if customEvents != nil {
+					for _, ce := range customEvents {
+						e.emit(ce)
+					}
+					continue
+				}
+			}
 
 			// Reasoning / thought parts: map to REASONING_* event lifecycle.
 			// ReasoningStart/End bracket the phase; ReasoningMessageStart/Content/End
