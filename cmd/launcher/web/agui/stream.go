@@ -79,20 +79,37 @@ func (e *runFinishedInterruptEvent) Validate() error {
 // emitter wraps the SSE writer and captures the first write error. After a
 // failure (typically a client disconnect), subsequent emit calls are no-ops.
 // This avoids per-call error checks while still stopping work promptly.
+//
+// When interceptors are configured, each event passes through the OnEmit chain
+// (in registration order) before being written. An interceptor may transform
+// the event, suppress it (return nil), or abort the stream (return an error).
 type emitter struct {
-	ctx    context.Context
-	w      http.ResponseWriter
-	writer *sse.SSEWriter
-	err    error
+	ctx          context.Context
+	w            http.ResponseWriter
+	writer       *sse.SSEWriter
+	err          error
+	interceptors []CallInterceptor
+	callCtx      *CallContext
 }
 
-func newEmitter(ctx context.Context, w http.ResponseWriter, writer *sse.SSEWriter) *emitter {
-	return &emitter{ctx: ctx, w: w, writer: writer}
+func newEmitter(ctx context.Context, w http.ResponseWriter, writer *sse.SSEWriter, interceptors []CallInterceptor, callCtx *CallContext) *emitter {
+	return &emitter{ctx: ctx, w: w, writer: writer, interceptors: interceptors, callCtx: callCtx}
 }
 
 func (e *emitter) emit(event events.Event) {
 	if e.err != nil {
 		return
+	}
+	for _, interceptor := range e.interceptors {
+		var err error
+		event, err = interceptor.OnEmit(e.ctx, e.callCtx, event)
+		if err != nil {
+			e.err = err
+			return
+		}
+		if event == nil {
+			return
+		}
 	}
 	e.err = e.writer.WriteEvent(e.ctx, e.w, event)
 }

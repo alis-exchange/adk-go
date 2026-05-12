@@ -515,7 +515,7 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			return
 		}
 
-		e := newEmitter(ctx, w, sse.NewSSEWriter())
+		e := newEmitter(ctx, w, sse.NewSSEWriter(), l.config.interceptors[:succeeded], callCtx)
 
 		// emitError sends a RunErrorEvent on the SSE stream and marks the run as
 		// finalized so that RunFinishedEvent is not also emitted.

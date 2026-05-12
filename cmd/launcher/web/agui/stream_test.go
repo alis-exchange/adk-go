@@ -2,6 +2,7 @@ package agui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -52,7 +53,7 @@ func parseSSEEvents(body string) []sseEvent {
 // inspect the SSE output after processing.
 func newTestEmitter() (*emitter, *httptest.ResponseRecorder) {
 	rec := httptest.NewRecorder()
-	return newEmitter(context.Background(), rec, sse.NewSSEWriter()), rec
+	return newEmitter(context.Background(), rec, sse.NewSSEWriter(), nil, nil), rec
 }
 
 // newTestLauncher creates a minimal aguiLauncher for testing processEvent.
@@ -89,7 +90,7 @@ func TestProcessEvent_TextStreaming(t *testing.T) {
 
 	// Second partial should reuse the same messageID (no new Start).
 	rec2 := httptest.NewRecorder()
-	e2 := newEmitter(context.Background(), rec2, sse.NewSSEWriter())
+	e2 := newEmitter(context.Background(), rec2, sse.NewSSEWriter(), nil, nil)
 
 	ev2 := session.NewEvent("inv1")
 	ev2.Content = genai.NewContentFromText(" world", genai.RoleModel)
@@ -740,6 +741,194 @@ func TestEscapeJSONPointer(t *testing.T) {
 				t.Errorf("escapeJSONPointer(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+type onEmitFunc struct {
+	PassthroughInterceptor
+	fn func(ctx context.Context, callCtx *CallContext, event events.Event) (events.Event, error)
+}
+
+func (o *onEmitFunc) OnEmit(ctx context.Context, callCtx *CallContext, event events.Event) (events.Event, error) {
+	return o.fn(ctx, callCtx, event)
+}
+
+func TestEmitter_OnEmit_PassThrough(t *testing.T) {
+	rec := httptest.NewRecorder()
+	interceptor := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, event events.Event) (events.Event, error) {
+		return event, nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{interceptor}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+	if e.err != nil {
+		t.Fatalf("emit error = %v", e.err)
+	}
+
+	evts := parseSSEEvents(rec.Body.String())
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != events.EventTypeRunStarted {
+		t.Errorf("event type = %v, want RUN_STARTED", evts[0].Type)
+	}
+}
+
+func TestEmitter_OnEmit_Suppress(t *testing.T) {
+	rec := httptest.NewRecorder()
+	interceptor := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, _ events.Event) (events.Event, error) {
+		return nil, nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{interceptor}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+	if e.err != nil {
+		t.Fatalf("emit error = %v", e.err)
+	}
+
+	evts := parseSSEEvents(rec.Body.String())
+	if len(evts) != 0 {
+		t.Fatalf("got %d events, want 0 (suppressed)", len(evts))
+	}
+}
+
+func TestEmitter_OnEmit_Error(t *testing.T) {
+	rec := httptest.NewRecorder()
+	interceptor := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, _ events.Event) (events.Event, error) {
+		return nil, fmt.Errorf("interceptor abort")
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{interceptor}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+	if e.err == nil {
+		t.Fatal("expected error from interceptor")
+	}
+	if e.err.Error() != "interceptor abort" {
+		t.Errorf("error = %v, want 'interceptor abort'", e.err)
+	}
+
+	// Subsequent emits should be no-ops.
+	e.emit(events.NewRunFinishedEvent("t1", "r1"))
+	evts := parseSSEEvents(rec.Body.String())
+	if len(evts) != 0 {
+		t.Fatalf("got %d events after error, want 0", len(evts))
+	}
+}
+
+func TestEmitter_OnEmit_Transform(t *testing.T) {
+	rec := httptest.NewRecorder()
+	interceptor := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, event events.Event) (events.Event, error) {
+		// Replace any event with RunError.
+		return events.NewRunErrorEvent("transformed"), nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{interceptor}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+	if e.err != nil {
+		t.Fatalf("emit error = %v", e.err)
+	}
+
+	evts := parseSSEEvents(rec.Body.String())
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != events.EventTypeRunError {
+		t.Errorf("event type = %v, want RUN_ERROR (transformed)", evts[0].Type)
+	}
+}
+
+func TestEmitter_OnEmit_Chain(t *testing.T) {
+	rec := httptest.NewRecorder()
+	var order []string
+
+	first := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, event events.Event) (events.Event, error) {
+		order = append(order, "first")
+		return event, nil
+	}}
+	second := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, event events.Event) (events.Event, error) {
+		order = append(order, "second")
+		return event, nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{first, second}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+	if e.err != nil {
+		t.Fatalf("emit error = %v", e.err)
+	}
+
+	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
+		t.Errorf("chain order = %v, want [first second]", order)
+	}
+}
+
+func TestEmitter_OnEmit_ChainSuppressShortCircuits(t *testing.T) {
+	rec := httptest.NewRecorder()
+	var secondCalled bool
+
+	first := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, _ events.Event) (events.Event, error) {
+		return nil, nil
+	}}
+	second := &onEmitFunc{fn: func(_ context.Context, _ *CallContext, event events.Event) (events.Event, error) {
+		secondCalled = true
+		return event, nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{first, second}, &CallContext{})
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+
+	if secondCalled {
+		t.Error("second interceptor should not be called after first suppresses")
+	}
+	evts := parseSSEEvents(rec.Body.String())
+	if len(evts) != 0 {
+		t.Fatalf("got %d events, want 0 (suppressed by first)", len(evts))
+	}
+}
+
+func TestEmitter_OnEmit_ReceivesCallContext(t *testing.T) {
+	rec := httptest.NewRecorder()
+	callCtx := &CallContext{User: &User{Name: "test-user", Authenticated: true}}
+
+	var receivedCtx *CallContext
+	interceptor := &onEmitFunc{fn: func(_ context.Context, cc *CallContext, event events.Event) (events.Event, error) {
+		receivedCtx = cc
+		return event, nil
+	}}
+	e := newEmitter(context.Background(), rec, sse.NewSSEWriter(), []CallInterceptor{interceptor}, callCtx)
+
+	e.emit(events.NewRunStartedEvent("t1", "r1"))
+
+	if receivedCtx == nil {
+		t.Fatal("OnEmit did not receive CallContext")
+	}
+	if receivedCtx.User.Name != "test-user" {
+		t.Errorf("CallContext.User.Name = %v, want test-user", receivedCtx.User.Name)
+	}
+}
+
+func TestPassthroughInterceptor(t *testing.T) {
+	var p PassthroughInterceptor
+	ctx := context.Background()
+
+	newCtx, err := p.Before(ctx, nil, nil, nil)
+	if err != nil {
+		t.Errorf("Before() error = %v", err)
+	}
+	if newCtx != ctx {
+		t.Error("Before() should return the same context")
+	}
+
+	event := events.NewRunStartedEvent("t1", "r1")
+	gotEvent, err := p.OnEmit(ctx, nil, event)
+	if err != nil {
+		t.Errorf("OnEmit() error = %v", err)
+	}
+	if gotEvent != event {
+		t.Error("OnEmit() should return the same event")
+	}
+
+	if err := p.After(ctx, nil, nil); err != nil {
+		t.Errorf("After() error = %v", err)
 	}
 }
 
