@@ -37,7 +37,7 @@ require (
 )
 
 require (
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260509034708-dc6811790596
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260513052422-1434ef3e997b
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 )
 

@@ -280,6 +280,59 @@ func TestProcessEvent_FunctionResponse(t *testing.T) {
 	}
 }
 
+func TestProcessEvent_ConfirmationInterrupt_ClosesOpenStep(t *testing.T) {
+	l := newTestLauncher("test-app")
+	e, rec := newTestEmitter()
+	state := &streamState{
+		runID:             "r1",
+		threadID:          "t1",
+		currentStepAuthor: "sub-agent",
+	}
+
+	ev := session.NewEvent("inv1")
+	ev.Content = &genai.Content{
+		Role: string(genai.RoleModel),
+		Parts: []*genai.Part{{
+			FunctionCall: &genai.FunctionCall{
+				ID:   "confirm-step",
+				Name: toolconfirmation.FunctionCallName,
+				Args: map[string]any{
+					"toolConfirmation": map[string]any{
+						"hint": "approve?",
+					},
+					"originalFunctionCall": map[string]any{
+						"ID":   "orig-step",
+						"Name": "do_thing",
+					},
+				},
+			},
+		}},
+	}
+
+	done, err := l.processEvent(e, ev, state)
+	if err != nil {
+		t.Fatalf("processEvent() error = %v", err)
+	}
+	if !done {
+		t.Fatal("processEvent() done = false, want true")
+	}
+	if state.currentStepAuthor != "" {
+		t.Errorf("currentStepAuthor = %q, want empty (step should be closed)", state.currentStepAuthor)
+	}
+
+	evts := parseSSEEvents(rec.Body.String())
+	// Should see: StepFinished, ToolCallStart, ToolCallArgs, ToolCallEnd, RunFinished
+	if len(evts) < 2 {
+		t.Fatalf("got %d events, want at least 2", len(evts))
+	}
+	if evts[0].Type != events.EventTypeStepFinished {
+		t.Errorf("event[0].Type = %v, want STEP_FINISHED (close open step before interrupt)", evts[0].Type)
+	}
+	if evts[0].str("stepName") != "sub-agent" {
+		t.Errorf("event[0].stepName = %v, want sub-agent", evts[0].str("stepName"))
+	}
+}
+
 func TestProcessEvent_ConfirmationInterrupt(t *testing.T) {
 	l := newTestLauncher("test-app")
 	e, rec := newTestEmitter()

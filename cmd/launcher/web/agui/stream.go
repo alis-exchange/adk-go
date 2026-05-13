@@ -351,6 +351,16 @@ func (l *aguiLauncher) emitInterrupt(e *emitter, state *streamState, fc *genai.F
 		}
 	}
 
+	// Close all open lifecycle events before emitting the interrupt terminal
+	// event. The AG-UI protocol requires all steps to be finished before
+	// RunFinished is sent.
+	closeTextMessage(e, state)
+	closeReasoningMessage(e, state)
+	if state.currentStepAuthor != "" {
+		e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
+		state.currentStepAuthor = ""
+	}
+
 	// Emit ToolCall events for the original tool (the agent's proposal).
 	// Per the AG-UI spec ("Tool-bound interrupts"), the interrupted run
 	// emits ToolCallStart/Args/End; the resumed run emits ToolCallResult.

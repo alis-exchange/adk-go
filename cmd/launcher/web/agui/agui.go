@@ -517,10 +517,25 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 
 		e := newEmitter(ctx, w, sse.NewSSEWriter(), l.config.interceptors[:succeeded], callCtx)
 
+		// finalizeLifecycle closes any open text messages, reasoning phases,
+		// and sub-agent steps. Must be called before any run-terminal event
+		// (RunFinished, RunError) to satisfy the AG-UI protocol requirement
+		// that all steps are closed before the run ends.
+		finalizeLifecycle := func() {
+			closeTextMessage(e, state)
+			closeReasoningMessage(e, state)
+			if state.currentStepAuthor != "" {
+				e.emit(events.NewStepFinishedEvent(state.currentStepAuthor))
+				state.currentStepAuthor = ""
+			}
+		}
+
 		// emitError sends a RunErrorEvent on the SSE stream and marks the run as
 		// finalized so that RunFinishedEvent is not also emitted.
-		emitError := func(errMsg string) {
-			e.emit(events.NewRunErrorEvent(errMsg, events.WithRunID(state.runID)))
+		emitError := func(errMsg string, opts ...events.RunErrorOption) {
+			finalizeLifecycle()
+			opts = append([]events.RunErrorOption{events.WithRunID(state.runID)}, opts...)
+			e.emit(events.NewRunErrorEvent(errMsg, opts...))
 			state.runFinalized = true
 		}
 
@@ -568,12 +583,11 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 			}
 
 			if ev.ErrorMessage != "" {
-				opts := []events.RunErrorOption{events.WithRunID(state.runID)}
+				var opts []events.RunErrorOption
 				if ev.ErrorCode != "" {
 					opts = append(opts, events.WithErrorCode(ev.ErrorCode))
 				}
-				e.emit(events.NewRunErrorEvent(ev.ErrorMessage, opts...))
-				state.runFinalized = true
+				emitError(ev.ErrorMessage, opts...)
 				handlerErr = fmt.Errorf("%s", ev.ErrorMessage)
 				break
 			}
@@ -611,6 +625,9 @@ func (l *aguiLauncher) runSSEHandler() http.Handler {
 		//   3. Cancelled resumes (status: "cancelled") should map to
 		//      confirmed=false with no payload.
 		// See: https://docs.ag-ui.com/concepts/interrupts
+
+		// Close any open lifecycle events before finalizing the run.
+		finalizeLifecycle()
 
 		// Emit RunFinishedEvent only if no terminal event (RunError) was already sent.
 		if !state.runFinalized {
