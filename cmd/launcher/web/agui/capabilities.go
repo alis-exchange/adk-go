@@ -37,11 +37,20 @@ type TransportCapabilities struct {
 	Resumable         *bool `json:"resumable,omitempty"`
 }
 
+// Tool describes a tool the agent provides, using JSON Schema for parameters.
+type Tool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  any            `json:"parameters"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
 // ToolsCapabilities declares tool calling support.
 type ToolsCapabilities struct {
-	Supported      *bool `json:"supported,omitempty"`
-	ParallelCalls  *bool `json:"parallelCalls,omitempty"`
-	ClientProvided *bool `json:"clientProvided,omitempty"`
+	Supported      *bool  `json:"supported,omitempty"`
+	Items          []Tool `json:"items,omitempty"`
+	ParallelCalls  *bool  `json:"parallelCalls,omitempty"`
+	ClientProvided *bool  `json:"clientProvided,omitempty"`
 }
 
 // OutputCapabilities declares output format support.
