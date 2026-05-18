@@ -293,11 +293,8 @@ func (c *RuntimeAPIController) getRunner(req models.RunAgentRequest) (*runner.Ru
 //  2. authCallbackUrl can be provided via query parameter (?authCallbackUrl=...) as a
 //     fallback. This supports the OAuth redirect flow where the browser reloads the page
 //     and the callback URL may not be in the JSON body.
-func decodeRequestBody(req *http.Request) (decodedReq models.RunAgentRequest, err error) {
+func decodeRequestBody(req *http.Request) (models.RunAgentRequest, error) {
 	var runAgentRequest models.RunAgentRequest
-	defer func() {
-		_ = req.Body.Close()
-	}()
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		return runAgentRequest, newStatusError(fmt.Errorf("failed to read request body: %w", err), http.StatusBadRequest)
