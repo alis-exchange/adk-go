@@ -190,7 +190,7 @@ func authPreprocessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flo
 					Parts: []*genai.Part{{FunctionCall: originalCall}},
 					Role:  genai.RoleUser,
 				},
-			}, nil)
+			}, nil, nil)
 			if !yield(ev, err) {
 				return
 			}
