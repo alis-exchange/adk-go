@@ -701,7 +701,7 @@ func toolPreprocess(ctx agent.InvocationContext, req *model.LLMRequest, tools []
 			return fmt.Errorf("tool %q does not implement RequestProcessor() method", t.Name())
 		}
 		// TODO: how to prevent mutation on this?
-		toolCtx := toolinternal.NewToolContext(ctx, "", &session.EventActions{}, nil)
+		toolCtx := agent.NewToolContext(ctx, "", &session.EventActions{}, nil)
 		if err := requestProcessor.ProcessRequest(toolCtx, req); err != nil {
 			return err
 		}
@@ -719,7 +719,7 @@ func toolsetPreprocess(ctx agent.InvocationContext, req *model.LLMRequest) error
 		if !ok {
 			continue // Not all toolsets implement RequestProcessor.
 		}
-		toolCtx := toolinternal.NewToolContext(ctx, "", nil, nil)
+		toolCtx := agent.NewToolContext(ctx, "", nil, nil)
 		if err := processor.ProcessRequest(toolCtx, req); err != nil {
 			return fmt.Errorf("process request by toolset %q: %w", toolset.Name(), err)
 		}
@@ -1053,7 +1053,7 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[st
 			if toolConfirmations != nil {
 				confirmation = toolConfirmations[fnCall.ID]
 			}
-			toolCtx := toolinternal.NewToolContext(toolCallCtx, fnCall.ID, &session.EventActions{StateDelta: make(map[string]any)}, confirmation)
+			toolCtx := agent.NewToolContext(toolCallCtx, fnCall.ID, &session.EventActions{StateDelta: make(map[string]any)}, confirmation)
 
 			var result map[string]any
 			var curTool tool.Tool
