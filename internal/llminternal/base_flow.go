@@ -54,11 +54,11 @@ type AfterModelCallback func(ctx agent.CallbackContext, llmResponse *model.LLMRe
 
 type OnModelErrorCallback func(ctx agent.CallbackContext, llmRequest *model.LLMRequest, llmResponseError error) (*model.LLMResponse, error)
 
-type BeforeToolCallback func(ctx tool.Context, tool tool.Tool, args map[string]any) (map[string]any, error)
+type BeforeToolCallback func(ctx agent.ToolContext, tool tool.Tool, args map[string]any) (map[string]any, error)
 
-type AfterToolCallback func(ctx tool.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error)
+type AfterToolCallback func(ctx agent.ToolContext, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error)
 
-type OnToolErrorCallback func(ctx tool.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
+type OnToolErrorCallback func(ctx agent.ToolContext, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
 
 type Flow struct {
 	Model model.LLM
@@ -997,7 +997,7 @@ Suggested fixes:
 }
 
 type cancelledToolContext struct {
-	tool.Context
+	agent.ToolContext
 	cancelCtx context.Context
 }
 
@@ -1080,8 +1080,8 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[st
 						result = map[string]any{"status": "The function is running asynchronously and the results are pending."}
 						cancelCtx, cancel := context.WithCancel(toolCtx)
 						cancelToolCtx := &cancelledToolContext{
-							Context:   toolCtx,
-							cancelCtx: cancelCtx,
+							ToolContext: toolCtx,
+							cancelCtx:   cancelCtx,
 						}
 						if impl, ok := liveSess.(*liveSessionImpl); ok {
 							impl.RegisterStreamingTool(streamTool.Name(), fnCall.ID, cancel)
@@ -1191,7 +1191,7 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[st
 	return mergedEvent, nil
 }
 
-func (f *Flow) runOnToolErrorCallbacks(toolCtx tool.Context, tool tool.Tool, fArgs map[string]any, err error) (map[string]any, error) {
+func (f *Flow) runOnToolErrorCallbacks(toolCtx agent.ToolContext, tool tool.Tool, fArgs map[string]any, err error) (map[string]any, error) {
 	pluginManager := pluginManagerFromContext(toolCtx)
 	if pluginManager != nil {
 		result, err := pluginManager.RunOnToolErrorCallback(toolCtx, tool, fArgs, err)
@@ -1202,7 +1202,7 @@ func (f *Flow) runOnToolErrorCallbacks(toolCtx tool.Context, tool tool.Tool, fAr
 	return f.invokeOnToolErrorCallbacks(toolCtx, tool, fArgs, err)
 }
 
-func (f *Flow) callTool(toolCtx tool.Context, tool toolinternal.FunctionTool, fArgs map[string]any) map[string]any {
+func (f *Flow) callTool(toolCtx agent.ToolContext, tool toolinternal.FunctionTool, fArgs map[string]any) map[string]any {
 	var response map[string]any
 	var err error
 	pluginManager := pluginManagerFromContext(toolCtx)
@@ -1249,7 +1249,7 @@ func (f *Flow) callTool(toolCtx tool.Context, tool toolinternal.FunctionTool, fA
 	return response
 }
 
-func (f *Flow) invokeBeforeToolCallbacks(toolCtx tool.Context, tool tool.Tool, fArgs map[string]any) (map[string]any, error) {
+func (f *Flow) invokeBeforeToolCallbacks(toolCtx agent.ToolContext, tool tool.Tool, fArgs map[string]any) (map[string]any, error) {
 	for _, callback := range f.BeforeToolCallbacks {
 		result, err := callback(toolCtx, tool, fArgs)
 		if err != nil {
@@ -1264,7 +1264,7 @@ func (f *Flow) invokeBeforeToolCallbacks(toolCtx tool.Context, tool tool.Tool, f
 	return nil, nil
 }
 
-func (f *Flow) invokeAfterToolCallbacks(toolCtx tool.Context, tool toolinternal.FunctionTool, fArgs, fResult map[string]any, fErr error) (map[string]any, error) {
+func (f *Flow) invokeAfterToolCallbacks(toolCtx agent.ToolContext, tool toolinternal.FunctionTool, fArgs, fResult map[string]any, fErr error) (map[string]any, error) {
 	for _, callback := range f.AfterToolCallbacks {
 		result, err := callback(toolCtx, tool, fArgs, fResult, fErr)
 		if err != nil {
@@ -1280,7 +1280,7 @@ func (f *Flow) invokeAfterToolCallbacks(toolCtx tool.Context, tool toolinternal.
 	return fResult, fErr
 }
 
-func (f *Flow) invokeOnToolErrorCallbacks(toolCtx tool.Context, tool tool.Tool, fArgs map[string]any, fErr error) (map[string]any, error) {
+func (f *Flow) invokeOnToolErrorCallbacks(toolCtx agent.ToolContext, tool tool.Tool, fArgs map[string]any, fErr error) (map[string]any, error) {
 	for _, callback := range f.OnToolErrorCallbacks {
 		result, err := callback(toolCtx, tool, fArgs, fErr)
 		if err != nil {
@@ -1391,7 +1391,7 @@ type pluginManager interface {
 	RunBeforeModelCallback(cctx agent.CallbackContext, llmRequest *model.LLMRequest) (*model.LLMResponse, error)
 	RunAfterModelCallback(cctx agent.CallbackContext, llmResponse *model.LLMResponse, llmResponseError error) (*model.LLMResponse, error)
 	RunOnModelErrorCallback(ctx agent.CallbackContext, llmRequest *model.LLMRequest, llmResponseError error) (*model.LLMResponse, error)
-	RunBeforeToolCallback(ctx tool.Context, t tool.Tool, args map[string]any) (map[string]any, error)
-	RunAfterToolCallback(ctx tool.Context, t tool.Tool, args, result map[string]any, err error) (map[string]any, error)
-	RunOnToolErrorCallback(ctx tool.Context, t tool.Tool, args map[string]any, err error) (map[string]any, error)
+	RunBeforeToolCallback(ctx agent.ToolContext, t tool.Tool, args map[string]any) (map[string]any, error)
+	RunAfterToolCallback(ctx agent.ToolContext, t tool.Tool, args, result map[string]any, err error) (map[string]any, error)
+	RunOnToolErrorCallback(ctx agent.ToolContext, t tool.Tool, args map[string]any, err error) (map[string]any, error)
 }
