@@ -30,6 +30,7 @@ import (
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/plugin"
 	"google.golang.org/adk/session"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -521,7 +522,11 @@ func (m *MockToolContext) SearchMemory(ctx context.Context, query string) (*memo
 	return nil, nil
 }
 func (m *MockToolContext) ToolConfirmation() *toolconfirmation.ToolConfirmation { return nil }
-func (m *MockToolContext) RequestConfirmation(hint string, payload any) error   { return nil }
+func (m *MockToolContext) RequestConfirmation(hint string, payload any) error { return nil }
+func (m *MockToolContext) RequestCredential(toolauth.AuthConfig) error          { return nil }
+func (m *MockToolContext) GetAuthResponse(toolauth.AuthConfig) (*toolauth.AuthCredential, error) {
+	return nil, nil
+}
 func (m *MockToolContext) AppName() string                                      { return "mock-app" }
 func (m *MockToolContext) Branch() string                                       { return "" }
 func (m *MockToolContext) SessionID() string                                    { return "mock-session-id" }

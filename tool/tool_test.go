@@ -30,6 +30,7 @@ import (
 	"google.golang.org/adk/tool/functiontool"
 	"google.golang.org/adk/tool/geminitool"
 	"google.golang.org/adk/tool/loadartifactstool"
+	"google.golang.org/adk/tool/toolauth"
 	"google.golang.org/adk/tool/toolconfirmation"
 )
 
@@ -126,6 +127,10 @@ func (c *testContext) ToolConfirmation() *toolconfirmation.ToolConfirmation {
 func (c *testContext) RequestConfirmation(string, any) error {
 	c.requestConfirmationCalled = true
 	return nil
+}
+func (c *testContext) RequestCredential(toolauth.AuthConfig) error { return nil }
+func (c *testContext) GetAuthResponse(toolauth.AuthConfig) (*toolauth.AuthCredential, error) {
+	return nil, nil
 }
 
 func (c *testContext) Actions() *session.EventActions {
