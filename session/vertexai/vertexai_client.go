@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"encoding/json"
 
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -68,7 +69,7 @@ func (c *vertexAiClient) createSession(ctx context.Context, req *session.CreateR
 	}
 	// Convert and set the initial state if provided
 	if len(req.State) > 0 {
-		stateStruct, err := structpb.NewStruct(req.State)
+		stateStruct, err := toStructPB(req.State)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert state to structpb: %w", err)
 		}
@@ -241,7 +242,7 @@ func (c *vertexAiClient) appendEvent(ctx context.Context, appName, sessionID str
 	var eventState *aiplatformpb.EventActions
 	// Convert and set the initial state if provided
 	if len(event.Actions.StateDelta) > 0 {
-		sessionState, err := structpb.NewStruct(event.Actions.StateDelta)
+		sessionState, err := toStructPB(event.Actions.StateDelta)
 		if err != nil {
 			return fmt.Errorf("failed to convert state to structpb: %w", err)
 		}
@@ -484,7 +485,7 @@ func createAiplatformpbContent(event *session.Event) (*aiplatformpb.Content, err
 				}
 			}
 			if part.FunctionCall != nil {
-				args, err := structpb.NewStruct(part.FunctionCall.Args)
+				args, err := toStructPB(part.FunctionCall.Args)
 				if err != nil {
 					return nil, fmt.Errorf("failed to convert function call to structpb: %w", err)
 				}
@@ -497,7 +498,7 @@ func createAiplatformpbContent(event *session.Event) (*aiplatformpb.Content, err
 				}
 			}
 			if part.FunctionResponse != nil {
-				response, err := structpb.NewStruct(part.FunctionResponse.Response)
+				response, err := toStructPB(part.FunctionResponse.Response)
 				if err != nil {
 					return nil, fmt.Errorf("failed to convert function response to structpb: %w", err)
 				}
@@ -531,7 +532,7 @@ func createAiplatformpbMetadata(event *session.Event) (*aiplatformpb.EventMetada
 		Branch:             event.Branch,
 	}
 	if event.CustomMetadata != nil {
-		customMetadata, err := structpb.NewStruct(event.CustomMetadata)
+		customMetadata, err := toStructPB(event.CustomMetadata)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert event customMetadata to structpb: %w", err)
 		}
@@ -761,6 +762,22 @@ func createGroundingMetadata(metadata *aiplatformpb.GroundingMetadata) *genai.Gr
 	}
 
 	return out
+}
+
+// toStructPB converts an arbitrary Go value into a protobuf Struct.
+// It uses JSON marshaling as an intermediary step to safely serialize
+// the input data before constructing the *structpb.Struct.
+// Returns an error if any part of the JSON round-trip or conversion fails.
+func toStructPB(value any) (*structpb.Struct, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal value: %w", err)
+	}
+	res := &structpb.Struct{}
+	if err := res.UnmarshalJSON(data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON data to structpb: %w", err)
+	}
+	return res, nil
 }
 
 // derefString is a helper to safely dereference string pointers
