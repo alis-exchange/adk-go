@@ -15,24 +15,98 @@
 package web
 
 import (
+	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 )
 
-// TestBuildBaseRouterHTTP1RouteStillWorks verifies that HTTP/1 routes still work.
-func TestBuildBaseRouterHTTP1RouteStillWorks(t *testing.T) {
-	router := BuildBaseRouter()
-	router.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
+func TestH2CFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantH2C bool
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name:    "enabled",
+			args:    []string{"--h2c"},
+			wantH2C: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			launcher := NewLauncher().(*webLauncher)
+			if _, err := launcher.Parse(tc.args); err != nil {
+				t.Fatalf("Parse(%v) failed: %v", tc.args, err)
+			}
 
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	rec := httptest.NewRecorder()
+			srv := launcher.buildHTTPServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Request-Protocol", r.Proto)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("net.Listen() failed: %v", err)
+			}
+			serveErr := make(chan error, 1)
+			go func() {
+				serveErr <- srv.Serve(listener)
+			}()
+			t.Cleanup(func() {
+				if err := srv.Close(); err != nil {
+					t.Errorf("server Close() failed: %v", err)
+				}
+				if err := <-serveErr; err != http.ErrServerClosed {
+					t.Errorf("server Serve() error = %v, want %v", err, http.ErrServerClosed)
+				}
+			})
 
-	router.ServeHTTP(rec, req)
+			url := "http://" + listener.Addr().String()
+			assertProtocol(t, http.DefaultClient, url, 1)
 
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("router response status = %d, want %d", rec.Code, http.StatusNoContent)
+			h2cProtocols := new(http.Protocols)
+			h2cProtocols.SetUnencryptedHTTP2(true)
+			h2cClient := &http.Client{
+				Transport: &http.Transport{Protocols: h2cProtocols},
+			}
+			t.Cleanup(h2cClient.CloseIdleConnections)
+
+			resp, err := h2cClient.Get(url)
+			if !tc.wantH2C {
+				if err == nil {
+					resp.Body.Close()
+					t.Fatalf("h2c request unexpectedly succeeded with protocol %q", resp.Proto)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("h2c request failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.ProtoMajor != 2 {
+				t.Errorf("h2c response protocol = %q, want HTTP/2", resp.Proto)
+			}
+			if got := resp.Header.Get("X-Request-Protocol"); got != "HTTP/2.0" {
+				t.Errorf("handler request protocol = %q, want %q", got, "HTTP/2.0")
+			}
+		})
+	}
+}
+
+func assertProtocol(t *testing.T, client *http.Client, url string, wantMajor int) {
+	t.Helper()
+
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("reading response body failed: %v", err)
+	}
+	if resp.ProtoMajor != wantMajor {
+		t.Errorf("response protocol = %q, want HTTP/%d", resp.Proto, wantMajor)
 	}
 }
