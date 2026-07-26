@@ -76,7 +76,9 @@ func TestH2CFlag(t *testing.T) {
 			resp, err := h2cClient.Get(url)
 			if !tc.wantH2C {
 				if err == nil {
-					resp.Body.Close()
+					if closeErr := resp.Body.Close(); closeErr != nil {
+						t.Errorf("response body Close() failed: %v", closeErr)
+					}
 					t.Fatalf("h2c request unexpectedly succeeded with protocol %q", resp.Proto)
 				}
 				return
@@ -84,7 +86,11 @@ func TestH2CFlag(t *testing.T) {
 			if err != nil {
 				t.Fatalf("h2c request failed: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("response body Close() failed: %v", err)
+				}
+			}()
 			if resp.ProtoMajor != 2 {
 				t.Errorf("h2c response protocol = %q, want HTTP/2", resp.Proto)
 			}
@@ -102,7 +108,11 @@ func assertProtocol(t *testing.T, client *http.Client, url string, wantMajor int
 	if err != nil {
 		t.Fatalf("HTTP request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("response body Close() failed: %v", err)
+		}
+	}()
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		t.Fatalf("reading response body failed: %v", err)
 	}
